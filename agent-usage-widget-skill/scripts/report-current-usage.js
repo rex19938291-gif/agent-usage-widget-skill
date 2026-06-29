@@ -5,8 +5,9 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 
 const HOME = process.env.HOME || "";
-const forceLive = !process.argv.includes("--no-live");
+const forceLive = process.argv.includes("--live") || process.argv.includes("--refresh-claude");
 const jsonOutput = process.argv.includes("--json");
+const debugOutput = process.argv.includes("--debug");
 
 function candidateSummaryScripts() {
   const candidates = [];
@@ -73,13 +74,13 @@ function buildReport(summary, source) {
     `- 1 週：${percent(remainingPercentFromUsed(claude?.weekAll?.usedPercent))}${resetTime(claude?.weekAll?.resetsAt)}`,
     `- Sonnet：${percent(remainingPercentFromUsed(claude?.weekSonnet?.usedPercent))}${resetTime(claude?.weekSonnet?.resetsAt)}`,
   ];
-  if (summary.claude?.official?.cache === "stale") {
-    lines.push("", "Claude 即時讀取失敗，以上 Claude 數字來自本機快取。");
+  if (forceLive && summary.claude?.official?.cache === "stale") {
+    lines.push("", "Claude 即時刷新暫時失敗，已改用小工具最近一次快取資料。");
   }
-  if (!forceLive) {
-    lines.push("", "這次使用 cached 模式，未強制刷新 Claude Keychain/API。");
+  if (debugOutput) {
+    lines.push("", `來源：${source}`);
+    if (!forceLive) lines.push("模式：讀取小工具快取，不強制刷新 Claude Keychain/API。");
   }
-  lines.push("", `來源：${source}`);
   return lines.join("\n");
 }
 

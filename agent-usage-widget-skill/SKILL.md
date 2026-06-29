@@ -30,16 +30,18 @@ node <skill-folder>/scripts/report-current-usage.js
 
 Then summarize the output in Traditional Chinese. Do not expose raw JSON unless the user asks.
 
+Important: the default slash query should not force a Claude live refresh. It should read the widget's local cache, because the desktop widget already refreshes Claude official usage every 60 seconds. This avoids false "Claude read failed" messages in mobile/background Codex sessions where macOS Keychain prompts cannot be handled.
+
 If the command says the widget data source is unavailable, explain briefly:
 
 - The query only works in a Codex environment that can read the same Mac user's `$HOME`.
 - Claude live percentages also require Claude Desktop to be logged in and Keychain access to `Claude Safe Storage`.
 - On a phone, the chat UI can trigger the skill, but the actual read still happens wherever Codex is executing. If that is not this Mac, it cannot see this Mac's local session.
 
-For a cached check that avoids forcing a Claude Keychain/API refresh, run:
+For an explicit live refresh, only when the user asks for it, run:
 
 ```bash
-node <skill-folder>/scripts/report-current-usage.js --no-live
+node <skill-folder>/scripts/report-current-usage.js --live
 ```
 
 ## What To Install

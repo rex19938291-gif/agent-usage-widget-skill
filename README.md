@@ -37,8 +37,7 @@ Use /agent-usage-widget-skill to install the macOS usage widget.
 /agent-usage-widget-skill
 ```
 
-若目前的 Codex 執行環境能讀到同一台 Mac 的本機檔案與 Claude Keychain，它會回報目前剩餘的用量百分比。若你從手機呼叫，但實際執行環境不是這台 Mac，就無法讀取這台 Mac 的即時 Keychain/session。
-```
+若目前的 Codex 執行環境能讀到同一台 Mac 的本機檔案，它會回報目前剩餘的用量百分比。預設查詢會讀取小工具最近一次快取資料，不會強制觸發 Claude Keychain/API 即時刷新；桌面小工具本身會每 60 秒更新 Claude 官方用量。若你從手機呼叫，但實際執行環境不是這台 Mac，就無法讀取這台 Mac 的本機資料。
 
 ## 隱私與安全
 
