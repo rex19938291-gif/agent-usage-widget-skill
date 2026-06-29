@@ -1,4 +1,0 @@
-interface:
-  display_name: "Agent Usage Widget"
-  short_description: "Install a local macOS desktop widget for Claude and Codex usage."
-  default_prompt: "Install the macOS Agent Usage Widget on this Mac so I can monitor Claude and Codex quota availability from the desktop."

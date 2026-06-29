@@ -307,21 +307,21 @@ function formatReset(epochSeconds) {
   if (!epochSeconds) return "n/a";
   const date = new Date(epochSeconds * 1000);
   const sameDay = date.toDateString() === new Date().toDateString();
-  return date.toLocaleString("en-US", sameDay
-    ? { hour: "numeric", minute: "2-digit", hour12: true }
-    : { month: "short", day: "numeric" });
+  return date.toLocaleString("zh-TW", sameDay
+    ? { hour: "numeric", minute: "2-digit", hour12: false }
+    : { month: "numeric", day: "numeric" });
 }
 
 function buildText(summary) {
   const c = summary.claude;
   const x = summary.codex;
   return [
-    "Codex available",
-    `5h ${formatPercent(remainingPercent(x.rateLimits?.primary?.used_percent))} ${formatReset(x.rateLimits?.primary?.resets_at)}`,
-    `1w ${formatPercent(remainingPercent(x.rateLimits?.secondary?.used_percent))} ${formatReset(x.rateLimits?.secondary?.resets_at)}`,
-    "Claude available",
-    `5h ${formatPercent(remainingPercent(c.official?.fiveHour?.usedPercent))} ${formatReset(c.official?.fiveHour?.resetsAt)}`,
-    `1w ${formatPercent(remainingPercent(c.official?.weekAll?.usedPercent))} ${formatReset(c.official?.weekAll?.resetsAt)}`,
+    "Codex 可用額度",
+    `5 小時 ${formatPercent(remainingPercent(x.rateLimits?.primary?.used_percent))} ${formatReset(x.rateLimits?.primary?.resets_at)}`,
+    `1 週 ${formatPercent(remainingPercent(x.rateLimits?.secondary?.used_percent))} ${formatReset(x.rateLimits?.secondary?.resets_at)}`,
+    "Claude 可用額度",
+    `5 小時 ${formatPercent(remainingPercent(c.official?.fiveHour?.usedPercent))} ${formatReset(c.official?.fiveHour?.resetsAt)}`,
+    `1 週 ${formatPercent(remainingPercent(c.official?.weekAll?.usedPercent))} ${formatReset(c.official?.weekAll?.resetsAt)}`,
     `Sonnet ${formatPercent(remainingPercent(c.official?.weekSonnet?.usedPercent))} ${formatReset(c.official?.weekSonnet?.resetsAt)}`,
   ].join("\n");
 }
@@ -432,11 +432,11 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         visual.layer?.masksToBounds = true
         visual.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.34).cgColor
 
-        titleLabel.stringValue = "Codex Available"
+        titleLabel.stringValue = "Codex 可用額度"
         titleLabel.frame = NSRect(x: 18, y: 198, width: 132, height: 18)
         visual.addSubview(titleLabel)
         updatedLabel.alignment = .right
-        updatedLabel.stringValue = "Updating"
+        updatedLabel.stringValue = "更新中"
         updatedLabel.frame = NSRect(x: 188, y: 198, width: 132, height: 18)
         visual.addSubview(updatedLabel)
 
@@ -447,24 +447,25 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.045).cgColor
         visual.addSubview(divider)
 
-        claudeTitle.stringValue = "Claude Available"
+        claudeTitle.stringValue = "Claude 可用額度"
         claudeTitle.frame = NSRect(x: 18, y: 98, width: 160, height: 18)
         visual.addSubview(claudeTitle)
         addRow(to: visual, y: 64, label: claudeFiveLabel, percent: claudeFivePercent, reset: claudeFiveReset)
         addRow(to: visual, y: 36, label: claudeWeekLabel, percent: claudeWeekPercent, reset: claudeWeekReset)
         addRow(to: visual, y: 12, label: claudeSonnetLabel, percent: claudeSonnetPercent, reset: claudeSonnetReset)
 
-        codexFiveLabel.stringValue = "5h"
-        codexWeekLabel.stringValue = "1w"
-        claudeFiveLabel.stringValue = "5h"
-        claudeWeekLabel.stringValue = "1w"
+        codexFiveLabel.stringValue = "5 小時"
+        codexWeekLabel.stringValue = "1 週"
+        claudeFiveLabel.stringValue = "5 小時"
+        claudeWeekLabel.stringValue = "1 週"
         claudeSonnetLabel.stringValue = "Sonnet"
         for label in [codexFivePercent, codexWeekPercent, claudeFivePercent, claudeWeekPercent, claudeSonnetPercent] { label.stringValue = "--%" }
         for label in [codexFiveReset, codexWeekReset, claudeFiveReset, claudeWeekReset, claudeSonnetReset] { label.stringValue = "--" }
 
         panel.contentView = visual
         positionTopLeft()
-        panel.orderFrontRegardless()
+        panel.orderFront(nil)
+        panel.orderBack(nil)
     }
 
     private func addRow(to parent: NSView, y: CGFloat, label: NSTextField, percent: NSTextField, reset: NSTextField) {
@@ -488,7 +489,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     private func refresh(forceClaude: Bool = false) {
         if isRefreshing { return }
         isRefreshing = true
-        updatedLabel.stringValue = "Updating"
+        updatedLabel.stringValue = "更新中"
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let process = Process()
@@ -506,11 +507,11 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
                     if process.terminationStatus == 0, let summary = try? JSONDecoder().decode(UsageSummary.self, from: data) {
                         self.updateUI(summary)
                     } else {
-                        self.updatedLabel.stringValue = "Failed"
+                        self.updatedLabel.stringValue = "更新失敗"
                     }
                 }
             } catch {
-                DispatchQueue.main.async { self.isRefreshing = false; self.updatedLabel.stringValue = "Failed" }
+                DispatchQueue.main.async { self.isRefreshing = false; self.updatedLabel.stringValue = "更新失敗" }
             }
         }
     }
@@ -529,7 +530,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         claudeFiveReset.stringValue = formatReset(claude?.fiveHour?.resetsAt, compact: false)
         claudeWeekReset.stringValue = formatReset(claude?.weekAll?.resetsAt, compact: true)
         claudeSonnetReset.stringValue = formatReset(claude?.weekSonnet?.resetsAt, compact: true)
-        updatedLabel.stringValue = "Last " + formatGeneratedAt(summary.generatedAt)
+        updatedLabel.stringValue = "上次 " + formatGeneratedAt(summary.generatedAt)
     }
 
     private func remainingPercent(fromUsed used: Double?) -> Double? {
@@ -651,4 +652,4 @@ fi
 
 echo "Installed Agent Usage Widget at $INSTALL_DIR"
 echo "LaunchAgent: $LAUNCH_AGENT"
-echo "If macOS prompts for Claude Safe Storage, choose Allow or Always Allow based on your security preference."
+echo "如果 macOS 提示 Claude Safe Storage，請依你的安全偏好選擇「允許」或「永遠允許」。"
