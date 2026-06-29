@@ -1,0 +1,12 @@
+.DS_Store
+*.log
+.cache/
+build/
+*.tmp
+TASK_HANDOFF.md
+CODEX_ACTIVE_TASK.md
+截圖*
+*.png
+*.jpg
+*.jpeg
+*.heic
