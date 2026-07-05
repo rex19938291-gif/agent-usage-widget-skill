@@ -224,7 +224,7 @@ function normalizeClaudeLimit(limit) {
   if (!limit || typeof limit !== "object") return { usedPercent: null, resetsAt: null };
   return {
     usedPercent: finiteOrNull(limit.utilization ?? limit.used_percentage ?? limit.usedPercent),
-    resetsAt: parseReset(limit.resets_at),
+    resetsAt: parseReset(limit.resets_at ?? limit.resetsAt),
   };
 }
 
