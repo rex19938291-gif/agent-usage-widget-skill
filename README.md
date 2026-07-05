@@ -81,13 +81,17 @@ cp -R /tmp/agent-usage-widget-skill-repo/agent-usage-widget-skill "$HOME/.codex/
 
 ## 額度用完後如何接續任務
 
-這個 skill 不能單靠自己保證 agent 在離線或被 rate limit 時自動醒來；那需要 Claude Code、Codex 或其他外部排程器本身提供喚醒能力。這個 skill 提供的是較可靠的恢復機制：在額度低或中斷前寫出本機 checkpoint，記錄回復時間、handoff 路徑、下一步，以及可交給 host scheduler 的一次性喚醒 prompt。
+這個 skill 不能單靠自己保證 agent 在離線或被 rate limit 時自動醒來；那需要 Claude Code、Codex 或其他外部排程器本身提供喚醒能力。這個 skill 預設提供的是較可靠的 checkpoint-only 恢復機制：在額度低或中斷前寫出本機 checkpoint，記錄回復時間、handoff 路徑、下一步，以及手動恢復 prompt。
 
-如果目前環境支援 thread wakeup / reminder / one-time automation，agent 應在建立 checkpoint 後，同步建立一個只執行一次的排程，在 `Resume after` 時間喚醒同一個任務。這個排程醒來後要先重新查額度；如果額度仍低於約 `10%`，就更新 checkpoint 並建立下一個一次性排程，然後停止。若額度已恢復且沒有使用者 approval gate，才繼續 checkpoint 裡記錄的下一步。排程執行後應結束，不要留下常駐循環。
+公開版預設不會建立喚醒排程。只有使用者明確下達 `不間斷開發`、`不中斷續跑`、`continuous development`、或「額度恢復後繼續自動執行」這類指令時，agent 才可以使用 `--uninterrupted` / `--continuous` 產生一次性喚醒 prompt，並交給 host scheduler 建立一次性排程。
+
+如果目前環境支援 thread wakeup / reminder / one-time automation，且 checkpoint 是在明確不間斷開發要求下用 `--uninterrupted` 建立，agent 才應同步建立一個只執行一次的排程，在 `Resume after` 時間喚醒同一個任務。這個排程醒來後要先重新查額度；如果額度仍低於約 `10%`，就更新 checkpoint，並且只有在不間斷模式仍明確適用時才建立下一個一次性排程，然後停止。若額度已恢復且沒有使用者 approval gate，才繼續 checkpoint 裡記錄的下一步。排程執行後應結束，不要留下常駐循環。
 
 Codex app 可用 thread heartbeat 叫醒指定 Codex thread；如果要恢復另一條暫停中的 Codex 任務，必須把 wakeup 指到那條 thread。Claude Code / Claude Desktop 則必須使用 Claude host 自己提供的 wakeup / reminder / scheduler；Codex 的 heartbeat 不能直接把 follow-up prompt 塞回 Claude 對話。如果 Claude host 沒有喚醒排程，就只能用外部一次性提醒或手動在 `Resume after` 後重新打開 Claude Code，讀 checkpoint 接續。
 
-若本機有 Claude Code CLI，也可以讓外部一次性排程在恢復時間呼叫 Claude 自己接續。知道 exact session id 時優先使用：
+Claude Desktop app 對話和 Claude Code CLI session 不同。`claude --resume` / `claude --continue` 只適用 Claude Code CLI，不能恢復 Claude Desktop app 既有對話。若任務是在 Claude Desktop app 裡啟動，除非 Claude Desktop 本身提供可呼叫的 scheduler/bridge，否則公開版只採提醒/手動貼上 checkpoint prompt，不用 GUI 自動化或 CLI 命令假裝恢復 Desktop app 對話。
+
+若本機有 Claude Code CLI，且使用者明確要求不間斷開發，也可以讓外部一次性排程在恢復時間呼叫 Claude 自己接續。知道 exact session id 時優先使用：
 
 ```bash
 claude --resume "<session-id>" --print "Continue the interrupted task. Read /path/to/CLAUDE_QUOTA_CONTINUATION.md first, preserve its Authorization Envelope, re-check quota, then continue."
@@ -112,6 +116,17 @@ node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-c
   --next "額度恢復後第一個要做的具體步驟"
 ```
 
+如果使用者明確要求不間斷開發，才加上 `--uninterrupted`：
+
+```bash
+node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-checkpoint.js" \
+  --service claude \
+  --task "目前任務名稱" \
+  --handoff "/path/to/TASK_HANDOFF.md" \
+  --next "額度恢復後第一個要做的具體步驟" \
+  --uninterrupted
+```
+
 如果安裝在 Codex，路徑通常是：
 
 ```bash
@@ -122,7 +137,7 @@ node "$HOME/.codex/skills/agent-usage-widget-skill/scripts/quota-continuation-ch
   --next "額度恢復後第一個要做的具體步驟"
 ```
 
-預設會在目前工作目錄建立 `AGENT_QUOTA_CONTINUATION.md`。等額度回復後，開新 Claude Code 或 Codex 對話，請 agent 先讀這個 checkpoint，再讀 handoff，確認 `/agent-usage-widget-skill` 顯示額度已恢復，然後從 checkpoint 裡的下一步接續。
+預設會在目前工作目錄建立 `AGENT_QUOTA_CONTINUATION.md`，且不授權建立任何喚醒排程。等額度回復後，開新 Claude Code 或 Codex 對話，請 agent 先讀這個 checkpoint，再讀 handoff，確認 `/agent-usage-widget-skill` 顯示額度已恢復，然後從 checkpoint 裡的下一步接續。
 
 ### 保留原任務授權
 
@@ -213,13 +228,17 @@ cp -R /tmp/agent-usage-widget-skill-repo/agent-usage-widget-skill "$HOME/.codex/
 
 ## Continue After Quota Exhaustion
 
-This skill cannot guarantee that an offline or rate-limited agent will wake itself up later by itself. That requires the host product or an external scheduler. Instead, it provides a recoverable checkpoint mechanism: before stopping, write the current task, handoff path, quota recovery time, next step, and a one-time wakeup prompt into a local checkpoint.
+This skill cannot guarantee that an offline or rate-limited agent will wake itself up later by itself. That requires the host product or an external scheduler. By default, it provides checkpoint-only recovery: before stopping, write the current task, handoff path, quota recovery time, next step, and a manual resume prompt into a local checkpoint.
 
-If the host supports thread wakeups, reminders, or one-time automations, the agent should create one one-shot wakeup for the checkpoint's `Resume after` time. When it fires, it should check quota first. If the relevant quota window is still under about `10%`, it should update the checkpoint, create the next one-time wakeup for the next recovery time, and stop. If quota has recovered and no approval gate is active, it should continue from the recorded next step. The wakeup should end after it runs; do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
+The public default must not create a wakeup schedule. Only when the user explicitly asks for uninterrupted or continuous development, such as `不間斷開發`, `不中斷續跑`, `continuous development`, or "keep working after quota recovers", may the agent pass `--uninterrupted` / `--continuous` and use the generated one-time wakeup prompt with the host scheduler.
+
+If the host supports thread wakeups, reminders, or one-time automations, and the checkpoint was created from an explicit uninterrupted-development request, the agent may create one one-shot wakeup for the checkpoint's `Resume after` time. When it fires, it should check quota first. If the relevant quota window is still under about `10%`, it should update the checkpoint, create the next one-time wakeup only while uninterrupted mode remains explicitly in scope, and stop. If quota has recovered and no approval gate is active, it should continue from the recorded next step. The wakeup should end after it runs; do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
 
 Codex app can use thread heartbeats to wake a specific Codex thread. If the paused task is in another Codex thread, the wakeup must explicitly target that thread. Claude Code / Claude Desktop must use Claude's own wakeup, reminder, or scheduler if one is available; a Codex heartbeat cannot directly post into a Claude conversation. If Claude has no host wakeup, use an external one-shot reminder or manually reopen Claude Code after `Resume after` and continue from the checkpoint.
 
-If the local Claude Code CLI is available, an external one-shot scheduler can invoke Claude itself after recovery. Prefer the exact session id when known:
+Claude Desktop app conversations are different from Claude Code CLI sessions. `claude --resume` and `claude --continue` apply to Claude Code CLI only; they do not resume an existing Claude Desktop app conversation. For tasks started in Claude Desktop, use Claude Desktop's own supported scheduler or bridge if available. Otherwise, use a reminder/manual paste workflow from the checkpoint; do not use GUI automation or Claude Code CLI commands as the public default for Desktop app recovery.
+
+If the local Claude Code CLI is available, and the user explicitly requested uninterrupted development, an external one-shot scheduler can invoke Claude itself after recovery. Prefer the exact session id when known:
 
 ```bash
 claude --resume "<session-id>" --print "Continue the interrupted task. Read /path/to/CLAUDE_QUOTA_CONTINUATION.md first, preserve its Authorization Envelope, re-check quota, then continue."
@@ -244,6 +263,17 @@ node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-c
   --next "First concrete step after quota recovery"
 ```
 
+Only add `--uninterrupted` when the user explicitly asked for uninterrupted or continuous development:
+
+```bash
+node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-checkpoint.js" \
+  --service claude \
+  --task "Current task name" \
+  --handoff "/path/to/TASK_HANDOFF.md" \
+  --next "First concrete step after quota recovery" \
+  --uninterrupted
+```
+
 Codex example:
 
 ```bash
@@ -254,7 +284,7 @@ node "$HOME/.codex/skills/agent-usage-widget-skill/scripts/quota-continuation-ch
   --next "First concrete step after quota recovery"
 ```
 
-The default output is `AGENT_QUOTA_CONTINUATION.md` in the current working directory. After quota recovers, start a new Claude Code or Codex session, ask it to read that checkpoint and the durable handoff, confirm quota with `/agent-usage-widget-skill`, then continue from the recorded next step.
+The default output is `AGENT_QUOTA_CONTINUATION.md` in the current working directory, and it does not authorize creating any wakeup schedule. After quota recovers, start a new Claude Code or Codex session, ask it to read that checkpoint and the durable handoff, confirm quota with `/agent-usage-widget-skill`, then continue from the recorded next step.
 
 ### Preserve Existing Task Authorization
 

@@ -15,6 +15,7 @@ function parseArgs(argv) {
     authorizations: [],
     notes: [],
     out: path.join(process.cwd(), "AGENT_QUOTA_CONTINUATION.md"),
+    uninterrupted: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
@@ -48,6 +49,8 @@ function parseArgs(argv) {
     } else if (key === "--out" && value) {
       args.out = value;
       i += 1;
+    } else if (key === "--uninterrupted" || key === "--continuous") {
+      args.uninterrupted = true;
     } else if (key === "--json") {
       args.json = true;
     } else {
@@ -69,6 +72,8 @@ function usage() {
     "  --authorization <text>         Preserved task authorization note. Repeatable.",
     "  --source-thread <id>           Optional original/source thread id.",
     "  --target-thread <id>           Optional paused task thread id to resume.",
+    "  --uninterrupted                Enable one-time wakeup prompt after explicit user request.",
+    "  --continuous                   Alias for --uninterrupted.",
     "  --out <path>                   Markdown checkpoint output path.",
     "  --json                         Print machine-readable result.",
   ].join("\n");
@@ -205,7 +210,9 @@ function buildWakeupPrompt(args, outPath) {
     ? `Then read the durable handoff: ${args.handoff}`
     : "Then locate and read the nearest durable project handoff if one exists.";
   return [
-    "Quota recovery wakeup for an interrupted agent task.",
+    "Quota recovery wakeup for an interrupted agent task in uninterrupted-development mode.",
+    "",
+    "Only use this prompt because the user explicitly requested uninterrupted or continuous development for this task.",
     "",
     `1. Read this checkpoint first: ${path.resolve(outPath)}`,
     `2. ${handoffLine}`,
@@ -243,10 +250,28 @@ function authorizationEnvelope(args) {
 
 function hostWakeupCompatibility() {
   return [
-    "- Codex app: use a one-time thread heartbeat. If resuming a different paused task thread, target that thread explicitly when the host supports `targetThreadId`.",
-    "- Claude Code / Claude Desktop: use Claude's own wakeup, reminder, or scheduler feature if the host exposes one. A Codex heartbeat cannot directly inject a follow-up into a Claude conversation.",
+    "- Codex app: if and only if the user explicitly requested uninterrupted development and this checkpoint was created with `--uninterrupted`, use a one-time thread heartbeat. If resuming a different paused task thread, target that thread explicitly when the host supports `targetThreadId`.",
+    "- Claude Code CLI: `claude --resume` or `claude --continue` can only resume Claude Code CLI sessions, and only from an explicit uninterrupted-development request plus a known session or working directory.",
+    "- Claude Desktop app: this script cannot resume an existing Desktop app conversation. Use Claude Desktop's own supported wakeup, reminder, or bridge if one exists; otherwise use an external reminder and paste the Resume Prompt manually. Do not use Claude Code CLI commands or GUI automation as a public default for Desktop app conversations.",
     "- External scheduler: if no agent-host wakeup exists, use an external one-shot reminder or scheduler to notify the user to reopen Claude/Codex with the resume prompt. Do not install launchd/cron jobs without explicit user approval.",
     "- Manual fallback: open a new Claude Code or Codex session after `Resume after`, read this checkpoint, read the handoff, re-check quota, and continue from `Next Step`.",
+  ].join("\n");
+}
+
+function automationGate(args) {
+  if (args.uninterrupted) {
+    return [
+      "The user explicitly requested uninterrupted or continuous development for this task.",
+      "",
+      "A host scheduler may create exactly one wakeup for the `Resume after` time, using the One-Time Wakeup Automation Prompt below. The wakeup must re-check quota before doing high-consumption work and must stop after it runs.",
+    ].join("\n");
+  }
+  return [
+    "Default mode is checkpoint-only. The user has not explicitly requested uninterrupted or continuous development for this task.",
+    "",
+    "Do not create a scheduler, reminder, thread wakeup, cron job, LaunchAgent, GUI automation, or external runner from this checkpoint.",
+    "",
+    "After `Resume after`, wait for the user to reopen Claude/Codex or use an already-approved reminder. To enable a one-time wakeup in a future checkpoint, the user must explicitly request uninterrupted development and the agent must pass `--uninterrupted` or `--continuous`.",
   ].join("\n");
 }
 
@@ -257,6 +282,21 @@ function buildMarkdown(args, usageResult, windows, resumeWindow) {
     const recovery = Number.isFinite(item.recoversAt) ? `; recovery-to-100% ${formatEpoch(item.recoversAt)}` : "; recovery-to-100% unknown";
     return `${item.label}: ${formatPercent(item.remaining)} remaining${recovery}`;
   });
+  const wakeupSection = args.uninterrupted
+    ? [
+        "## One-Time Wakeup Automation Prompt",
+        "",
+        "The user explicitly requested uninterrupted or continuous development. If the current host supports thread wakeups, reminders, or one-time automations, schedule this prompt for the `Resume after` time. Do not create a noisy recurring automation.",
+        "",
+        "```text",
+        buildWakeupPrompt(args, args.out),
+        "```",
+      ]
+    : [
+        "## Wakeup Automation",
+        "",
+        "Disabled. This checkpoint does not authorize creating a one-time wakeup because the user did not explicitly request uninterrupted or continuous development.",
+      ];
   const lines = [
     "# Agent Quota Continuation Checkpoint",
     "",
@@ -265,6 +305,7 @@ function buildMarkdown(args, usageResult, windows, resumeWindow) {
     `Working directory: ${cwd}`,
     `Preferred service: ${args.service}`,
     `Resume after: ${resumeWindow ? `${formatEpoch(resumeWindow.recoversAt)} (${resumeWindow.label})` : "unknown; check quota again before resuming"}`,
+    `Automation mode: ${args.uninterrupted ? "uninterrupted development requested; one-time wakeup prompt enabled" : "checkpoint-only; wakeup automation disabled"}`,
     args.sourceThread ? `Source thread: ${args.sourceThread}` : null,
     args.targetThread ? `Target thread: ${args.targetThread}` : null,
     args.handoff ? `Handoff: ${args.handoff}` : "Handoff: not provided",
@@ -280,6 +321,10 @@ function buildMarkdown(args, usageResult, windows, resumeWindow) {
     "## Notes",
     "",
     markdownList(args.notes),
+    "",
+    "## Automation Gate",
+    "",
+    automationGate(args),
     "",
     "## Authorization Envelope",
     "",
@@ -299,13 +344,7 @@ function buildMarkdown(args, usageResult, windows, resumeWindow) {
     "Do not redo completed work unless current files or verification show it is stale.",
     "```",
     "",
-    "## Optional One-Time Wakeup Automation Prompt",
-    "",
-    "If the current host supports thread wakeups, reminders, or one-time automations, schedule this prompt for the `Resume after` time. Do not create a noisy recurring automation.",
-    "",
-    "```text",
-    buildWakeupPrompt(args, args.out),
-    "```",
+    ...wakeupSection,
     "",
     "## Host Wakeup Compatibility",
     "",
@@ -333,11 +372,12 @@ function main() {
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, buildMarkdown({ ...args, out: outPath }, usageResult, windows, resumeWindow), { mode: 0o600 });
 
-  const wakeupPrompt = buildWakeupPrompt(args, outPath);
+  const wakeupPrompt = args.uninterrupted ? buildWakeupPrompt(args, outPath) : null;
   const result = {
     checkpoint: outPath,
     resumeAfter: resumeWindow ? formatEpoch(resumeWindow.recoversAt) : null,
     resumeWindow: resumeWindow?.label || null,
+    automationEnabled: Boolean(args.uninterrupted),
     wakeupPrompt,
     usageAvailable: !usageResult.error,
   };
@@ -346,6 +386,7 @@ function main() {
   } else {
     console.log(`Wrote quota continuation checkpoint: ${outPath}`);
     if (result.resumeAfter) console.log(`Suggested resume after: ${result.resumeAfter} (${result.resumeWindow})`);
+    if (!result.automationEnabled) console.log("One-time wakeup prompt disabled; pass --uninterrupted only after the user explicitly requests uninterrupted development.");
     if (!result.usageAvailable) console.log("Usage snapshot unavailable; check quota again before resuming.");
   }
 }

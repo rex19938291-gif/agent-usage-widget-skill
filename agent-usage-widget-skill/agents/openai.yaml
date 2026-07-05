@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Usage Widget"
-  short_description: "Quota widget, checker, and resume checkpoint"
-  default_prompt: "Use $agent-usage-widget-skill to report this Mac's Claude/Codex remaining usage, recovery-to-100% times, and create a quota continuation checkpoint if the current task may be interrupted."
+  short_description: "Quota widget, checker, and safe resume checkpoint"
+  default_prompt: "Use $agent-usage-widget-skill to report this Mac's Claude/Codex remaining usage and recovery-to-100% times. Create checkpoint-only quota continuation files for interrupted tasks; enable one-time wakeup automation only after an explicit uninterrupted-development request."

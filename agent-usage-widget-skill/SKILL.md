@@ -55,9 +55,11 @@ node <skill-folder>/scripts/report-current-usage.js --live
 
 ## Quota Recovery Continuation
 
-No skill can guarantee that an offline or rate-limited agent will automatically wake itself up later unless the host product also provides a scheduler, reminder, or automation. The reliable default is to make interruption recoverable: checkpoint the task before stopping, record the recovery time, and give the next agent a restart prompt.
+No skill can guarantee that an offline or rate-limited agent will automatically wake itself up later unless the host product also provides a scheduler, reminder, or automation. The safe default is checkpoint-only recovery: checkpoint the task before stopping, record the recovery time, and give the next agent a restart prompt.
 
-Use this mode when quota is very low, quota is exhausted, a long task is likely to cross a quota window, or the user asks how to continue after quota recovery.
+Do not create a wakeup automation by default. Only enable a one-time wakeup when the user explicitly asks for uninterrupted or continuous development, for example `不間斷開發`, `不中斷續跑`, `keep working after quota recovers`, or `continuous development`. A normal quota query, normal install, or ordinary long-task checkpoint is not enough consent to schedule a wakeup.
+
+Use checkpoint-only mode when quota is very low, quota is exhausted, a long task is likely to cross a quota window, or the user asks how to continue after quota recovery.
 
 1. Run the normal quota report first.
 2. If the active quota window is under about `10%`, stop high-consumption actions such as browser screenshot matrices, large imports/exports, package installs, or broad multi-agent work.
@@ -73,15 +75,27 @@ node <skill-folder>/scripts/quota-continuation-checkpoint.js \
 ```
 
 4. Tell the user the checkpoint path and the suggested `Resume after` time from the command output.
-5. If the host provides thread wakeups, reminders, or one-time automations, create a one-time wakeup for the `Resume after` time using the `Optional One-Time Wakeup Automation Prompt` written into the checkpoint. In Codex app, prefer a thread heartbeat automation attached to the current thread; if resuming a different paused task thread, explicitly target that task thread when the host supports it. In Claude Code or Claude Desktop, use Claude's own wakeup/reminder/scheduler feature if available. Do not hand-write raw scheduler config; use the host-provided automation/reminder tool.
-6. The wakeup prompt must check quota again before continuing. If quota is still under about `10%`, it should update the checkpoint and create one new one-time wakeup for the next recovery time, then stop.
-7. The wakeup prompt must preserve the original task's authorization envelope. If the same task thread, task card, or handoff already records approval for the next action, do not ask the user to approve the same action again merely because this is a resumed turn. Ask only when the action is outside the preserved scope or the host requires a tool-level approval.
-8. After the wakeup fires, it must end as a one-time run. Do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
-9. If no host wakeup/reminder exists, ask the user to reopen Claude/Codex after the `Resume after` time and paste/use the checkpoint's resume prompt.
+5. The default checkpoint must not include a wakeup prompt. If the user explicitly requested uninterrupted or continuous development, create the checkpoint with `--uninterrupted` or `--continuous`, then use the generated `One-Time Wakeup Automation Prompt`.
+6. If the host provides thread wakeups, reminders, or one-time automations, and the checkpoint was created with `--uninterrupted`, create exactly one wakeup for the `Resume after` time. In Codex app, prefer a thread heartbeat attached to the current thread; if resuming a different paused task thread, explicitly target that task thread when the host supports it. In Claude Code or Claude Desktop, use Claude's own wakeup/reminder/scheduler feature if available. Do not hand-write raw scheduler config; use the host-provided automation/reminder tool.
+7. The wakeup prompt must check quota again before continuing. If quota is still under about `10%`, it should update the checkpoint and create one new one-time wakeup for the next recovery time only if uninterrupted mode is still explicitly in scope, then stop.
+8. The wakeup prompt must preserve the original task's authorization envelope. If the same task thread, task card, or handoff already records approval for the next action, do not ask the user to approve the same action again merely because this is a resumed turn. Ask only when the action is outside the preserved scope or the host requires a tool-level approval.
+9. After the wakeup fires, it must end as a one-time run. Do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
+10. If no host wakeup/reminder exists, ask the user to reopen Claude/Codex after the `Resume after` time and paste/use the checkpoint's resume prompt.
 
 The default checkpoint path is `AGENT_QUOTA_CONTINUATION.md` in the current working directory. It may contain local paths and task details, so do not commit it publicly without review.
 
 Keep this separation clear: the widget reports quota state and writes the checkpoint; the host scheduler owns waking an agent or notifying the user. Without a scheduler, the mechanism is resumable but not automatic.
+
+Uninterrupted mode example:
+
+```bash
+node <skill-folder>/scripts/quota-continuation-checkpoint.js \
+  --service auto \
+  --task "<current task name>" \
+  --handoff "<path to TASK_HANDOFF.md or project handoff, if any>" \
+  --next "<single concrete next step>" \
+  --uninterrupted
+```
 
 ### Preserve The Task Authorization Envelope
 
@@ -116,7 +130,9 @@ node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-c
 
 If Claude's host does not expose a wakeup/reminder/scheduler, the checkpoint is still useful but not automatic: the user or an external scheduler must reopen Claude Code after `Resume after` and ask it to read `AGENT_QUOTA_CONTINUATION.md`. Codex app heartbeat automations can resume Codex threads, but they cannot directly post into a Claude conversation unless Claude exposes a supported bridge.
 
-When a local Claude Code CLI is available, an external one-shot scheduler may use Claude itself as the executor after quota recovers. Prefer resuming the exact session when known:
+Claude Desktop app conversations are different from Claude Code CLI sessions. `claude --resume` and `claude --continue` do not resume an existing Claude Desktop app conversation. For a task started in Claude Desktop, use Claude Desktop's own supported scheduler/bridge if one exists; otherwise use a reminder/manual paste workflow from the checkpoint. Do not use GUI automation or Claude Code CLI commands as the public default for Desktop app recovery.
+
+When a local Claude Code CLI is available, and the user explicitly requested uninterrupted or continuous development, an external one-shot scheduler may use Claude itself as the executor after quota recovers. Prefer resuming the exact session when known:
 
 ```bash
 claude --resume "<session-id>" --print "Continue the interrupted task. Read <checkpoint> first, preserve its Authorization Envelope, re-check quota, then continue."
