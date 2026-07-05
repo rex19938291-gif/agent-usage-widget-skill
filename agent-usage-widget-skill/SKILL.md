@@ -1,13 +1,21 @@
 ---
 name: agent-usage-widget-skill
-description: Install, maintain, and query a local macOS desktop widget that shows Claude and Codex quota availability. Use when a user invokes /agent-usage-widget-skill, asks for current remaining Claude/Codex usage percentages, or wants to install, update, troubleshoot, auto-start, uninstall, or package a Mac desktop usage monitor for Claude Desktop, Claude Code, Codex CLI, or Codex app usage percentages. 也適用於使用者想在 Mac 桌面查看或直接詢問 Claude / Codex 目前剩餘可用額度百分比、設定開機自動啟動、或排查 macOS Keychain 提示時。
+description: Install, maintain, and query a local macOS desktop widget that shows Claude and Codex quota availability. Use in Claude Code, Codex, or compatible Agent Skills clients when a user invokes /agent-usage-widget-skill, asks for current remaining Claude/Codex usage percentages, asks when usage recovers to 100%, or wants to install, update, troubleshoot, auto-start, uninstall, or package a Mac desktop usage monitor for Claude Desktop, Claude Code, Codex CLI, or Codex app usage percentages. 也適用於想在 Mac 桌面查看或直接詢問 Claude / Codex 剩餘可用額度百分比、回復 100% 時間、設定開機自動啟動、或排查 macOS Keychain 提示時。
 ---
 
 # Agent Usage Widget
 
 Use this skill to query, install, or update a local-only macOS desktop widget that shows Claude and Codex quota availability.
 
-繁體中文重點：這個 skill 會替使用者安裝一個 macOS 桌面小工具，用百分比呈現 Claude 與 Codex 的可用額度。它只讀取本機資料；Claude 官方百分比會使用使用者既有的 Claude Desktop 登入 session，在記憶體中查詢官方 usage API，不得輸出或保存 cookie、token、org ID 或 Keychain secret。
+繁體中文重點：這個 skill 會替使用者安裝一個 macOS 桌面小工具，用百分比呈現 Claude 與 Codex 的可用額度與回復 100% 時間。它只讀取本機資料；Claude 官方百分比會使用使用者既有的 Claude Desktop 登入 session，在記憶體中查詢官方 usage API。不得輸出、保存、提交 cookie、token、org ID 或 Keychain secret，也不得傳送給 Claude 官方 API 以外的第三方。
+
+## Agent Compatibility
+
+This skill follows the Agent Skills folder pattern: `SKILL.md` is the entrypoint, `scripts/` contains executable helpers, and `agents/openai.yaml` contains Codex/OpenAI UI metadata. It is usable from Claude Code, Codex, and other compatible agents that can read a skill folder and run local scripts with user approval.
+
+Use `<skill-folder>` to mean the directory containing this `SKILL.md`. In Claude Code, this is the installed skill directory such as `$HOME/.claude/skills/agent-usage-widget-skill`; in Codex, it is the installed skill directory such as `$HOME/.codex/skills/agent-usage-widget-skill`.
+
+Do not assume shell commands are pre-approved. Ask for or rely on the host's normal approval flow before running installer, Keychain, LaunchAgent, GUI-launch, or uninstall commands.
 
 ## 使用情境
 
@@ -18,9 +26,9 @@ Use this skill to query, install, or update a local-only macOS desktop widget th
 - 使用者遇到 `Claude Safe Storage` 的 macOS Keychain 提示，需要你解釋 `允許` / `永遠允許` 的差異。
 - 使用者想更新、排查或移除這個本機小工具。
 
-## Default Slash Behavior
+## Default Skill Behavior
 
-When the user invokes `/agent-usage-widget-skill` without asking to install, update, or uninstall, report the current remaining usage percentages first.
+When the user invokes `/agent-usage-widget-skill` without asking to install, update, or uninstall, report the current remaining usage percentages and recovery-to-100% timing first.
 
 Run:
 
@@ -67,7 +75,7 @@ $HOME/Library/LaunchAgents/com.agentusage.widget.plist
 ## Data Sources
 
 - Codex: local `$HOME/.codex/sessions/**/*.jsonl` rate-limit records.
-- Claude: local Claude Desktop cookie store plus macOS Keychain entry `Claude Safe Storage`, used only in memory to query `https://claude.ai/api/organizations/<org_uuid>/usage`.
+- Claude: local Claude Desktop cookie store plus macOS Keychain entry `Claude Safe Storage`, used only in memory to query the official `https://claude.ai/api/organizations/<org_uuid>/usage` endpoint.
 - Claude fallback: if Claude Desktop is not installed, not logged in, or Keychain access is denied, show unavailable Claude percentages without crashing.
 
 ## 顯示方式
@@ -75,14 +83,18 @@ $HOME/Library/LaunchAgents/com.agentusage.widget.plist
 - Codex：顯示 `5 小時` 與 `1 週` 可用額度百分比。
 - Claude：顯示 `5 小時`、`1 週` 與 `Sonnet` 可用額度百分比。
 - 百分比代表可用額度，不是已使用額度。
+- 對話查詢應同時顯示查詢時間、資料生成時間，以及各窗口回復 100% 的時間；如果已是 100%，直接標示已是 100%。
 - 小工具應維持低干擾桌面層級；一般 App 視窗可以覆蓋它。
 - Claude 官方用量每 60 秒強制刷新一次。
 
 ## Safety Rules
 
 - Do not print, log, cache, or save Claude cookies, tokens, organization IDs, or Keychain secrets.
+- Use Claude cookies, tokens, and organization IDs only for the official Claude usage API request; never send them to third-party services.
 - Cache only non-sensitive usage percentages and timestamps.
 - Use `$HOME` and runtime discovery. Do not hard-code a developer's username, absolute home path, LaunchAgent label, org ID, PID, or local project path.
+- Keep the public skill free of `allowed-tools` preapprovals or dynamic shell injection unless a maintainer deliberately reviews and accepts that broader trust model.
+- When spawning child Node processes from an agent session, avoid forwarding common agent/API token environment variables.
 - Before publishing or committing, scan the skill for private paths, tokens, cache files, screenshots, and handoff files.
 
 ## User Prompts To Explain

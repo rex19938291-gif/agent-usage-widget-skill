@@ -21,10 +21,11 @@ const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 
 const HOME = process.env.HOME;
+const INSTALL_DIR = process.env.AGENT_USAGE_WIDGET_DIR || path.join(HOME, ".agent-usage-widget");
 const CLAUDE_ROOT = path.join(HOME, ".claude", "projects");
 const CODEX_ROOT = path.join(HOME, ".codex", "sessions");
 const CLAUDE_COOKIE_DB = path.join(HOME, "Library", "Application Support", "Claude", "Cookies");
-const CACHE_DIR = path.join(HOME, ".agent-usage-widget", ".cache");
+const CACHE_DIR = path.join(INSTALL_DIR, ".cache");
 const CLAUDE_USAGE_CACHE = path.join(CACHE_DIR, "claude-usage-percentages.json");
 const FORCE_CLAUDE_REFRESH = process.argv.includes("--refresh-claude");
 
@@ -312,17 +313,28 @@ function formatReset(epochSeconds) {
     : { month: "numeric", day: "numeric" });
 }
 
+function recoveryText(epochSeconds, remainingPercent) {
+  if (Number.isFinite(remainingPercent) && Math.round(remainingPercent) >= 100) return "已是 100%";
+  if (!Number.isFinite(epochSeconds)) return "回復 100%：n/a";
+  return `回復 100%：${formatReset(epochSeconds)}`;
+}
+
 function buildText(summary) {
   const c = summary.claude;
   const x = summary.codex;
+  const codexPrimaryRemaining = remainingPercent(x.rateLimits?.primary?.used_percent);
+  const codexSecondaryRemaining = remainingPercent(x.rateLimits?.secondary?.used_percent);
+  const claudeFiveRemaining = remainingPercent(c.official?.fiveHour?.usedPercent);
+  const claudeWeekRemaining = remainingPercent(c.official?.weekAll?.usedPercent);
+  const claudeSonnetRemaining = remainingPercent(c.official?.weekSonnet?.usedPercent);
   return [
     "Codex 可用額度",
-    `5 小時 ${formatPercent(remainingPercent(x.rateLimits?.primary?.used_percent))} ${formatReset(x.rateLimits?.primary?.resets_at)}`,
-    `1 週 ${formatPercent(remainingPercent(x.rateLimits?.secondary?.used_percent))} ${formatReset(x.rateLimits?.secondary?.resets_at)}`,
+    `5 小時 ${formatPercent(codexPrimaryRemaining)} ${recoveryText(x.rateLimits?.primary?.resets_at, codexPrimaryRemaining)}`,
+    `1 週 ${formatPercent(codexSecondaryRemaining)} ${recoveryText(x.rateLimits?.secondary?.resets_at, codexSecondaryRemaining)}`,
     "Claude 可用額度",
-    `5 小時 ${formatPercent(remainingPercent(c.official?.fiveHour?.usedPercent))} ${formatReset(c.official?.fiveHour?.resetsAt)}`,
-    `1 週 ${formatPercent(remainingPercent(c.official?.weekAll?.usedPercent))} ${formatReset(c.official?.weekAll?.resetsAt)}`,
-    `Sonnet ${formatPercent(remainingPercent(c.official?.weekSonnet?.usedPercent))} ${formatReset(c.official?.weekSonnet?.resetsAt)}`,
+    `5 小時 ${formatPercent(claudeFiveRemaining)} ${recoveryText(c.official?.fiveHour?.resetsAt, claudeFiveRemaining)}`,
+    `1 週 ${formatPercent(claudeWeekRemaining)} ${recoveryText(c.official?.weekAll?.resetsAt, claudeWeekRemaining)}`,
+    `Sonnet ${formatPercent(claudeSonnetRemaining)} ${recoveryText(c.official?.weekSonnet?.resetsAt, claudeSonnetRemaining)}`,
   ].join("\n");
 }
 

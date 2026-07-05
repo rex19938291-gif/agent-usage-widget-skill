@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Usage Widget"
-  short_description: "查詢或安裝本機 macOS 小工具，用百分比查看 Claude 與 Codex 剩餘額度。"
-  default_prompt: "請先回報這台 Mac 目前 Claude 與 Codex 剩餘可用額度百分比；如果尚未安裝小工具，再詢問是否要安裝。"
+  short_description: "Claude/Codex quota widget and checker"
+  default_prompt: "Use $agent-usage-widget-skill to report this Mac's current Claude and Codex remaining usage percentages and recovery-to-100% times; if unavailable, explain how to install the macOS widget."
