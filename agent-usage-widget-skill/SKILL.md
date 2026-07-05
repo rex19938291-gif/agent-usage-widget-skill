@@ -116,6 +116,21 @@ node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-c
 
 If Claude's host does not expose a wakeup/reminder/scheduler, the checkpoint is still useful but not automatic: the user or an external scheduler must reopen Claude Code after `Resume after` and ask it to read `AGENT_QUOTA_CONTINUATION.md`. Codex app heartbeat automations can resume Codex threads, but they cannot directly post into a Claude conversation unless Claude exposes a supported bridge.
 
+When a local Claude Code CLI is available, an external one-shot scheduler may use Claude itself as the executor after quota recovers. Prefer resuming the exact session when known:
+
+```bash
+claude --resume "<session-id>" --print "Continue the interrupted task. Read <checkpoint> first, preserve its Authorization Envelope, re-check quota, then continue."
+```
+
+If the original Claude task is the most recent conversation in the same working directory, use:
+
+```bash
+cd "<original working directory>"
+claude --continue --print "Continue the interrupted task. Read <checkpoint> first, preserve its Authorization Envelope, re-check quota, then continue the original task without re-asking for already-granted approvals."
+```
+
+Do not use `--dangerously-skip-permissions` for quota recovery. Host-level permission prompts remain authoritative. If neither exact session id nor working directory is known, start a new Claude Code session from the checkpoint instead of guessing the wrong conversation.
+
 ## What To Install
 
 Run the bundled installer:

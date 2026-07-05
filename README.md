@@ -87,6 +87,21 @@ cp -R /tmp/agent-usage-widget-skill-repo/agent-usage-widget-skill "$HOME/.codex/
 
 Codex app 可用 thread heartbeat 叫醒指定 Codex thread；如果要恢復另一條暫停中的 Codex 任務，必須把 wakeup 指到那條 thread。Claude Code / Claude Desktop 則必須使用 Claude host 自己提供的 wakeup / reminder / scheduler；Codex 的 heartbeat 不能直接把 follow-up prompt 塞回 Claude 對話。如果 Claude host 沒有喚醒排程，就只能用外部一次性提醒或手動在 `Resume after` 後重新打開 Claude Code，讀 checkpoint 接續。
 
+若本機有 Claude Code CLI，也可以讓外部一次性排程在恢復時間呼叫 Claude 自己接續。知道 exact session id 時優先使用：
+
+```bash
+claude --resume "<session-id>" --print "Continue the interrupted task. Read /path/to/CLAUDE_QUOTA_CONTINUATION.md first, preserve its Authorization Envelope, re-check quota, then continue."
+```
+
+若原任務是同一工作目錄中最近的 Claude 對話，可使用：
+
+```bash
+cd "/path/to/original/workdir"
+claude --continue --print "Continue the interrupted task. Read /path/to/CLAUDE_QUOTA_CONTINUATION.md first, preserve its Authorization Envelope, re-check quota, then continue the original task without re-asking for already-granted approvals."
+```
+
+不要為了恢復額度任務使用 `--dangerously-skip-permissions`。host 本身跳出的權限要求仍然必須遵守。
+
 在長任務中，agent 應在額度很低時執行：
 
 ```bash
@@ -203,6 +218,21 @@ This skill cannot guarantee that an offline or rate-limited agent will wake itse
 If the host supports thread wakeups, reminders, or one-time automations, the agent should create one one-shot wakeup for the checkpoint's `Resume after` time. When it fires, it should check quota first. If the relevant quota window is still under about `10%`, it should update the checkpoint, create the next one-time wakeup for the next recovery time, and stop. If quota has recovered and no approval gate is active, it should continue from the recorded next step. The wakeup should end after it runs; do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
 
 Codex app can use thread heartbeats to wake a specific Codex thread. If the paused task is in another Codex thread, the wakeup must explicitly target that thread. Claude Code / Claude Desktop must use Claude's own wakeup, reminder, or scheduler if one is available; a Codex heartbeat cannot directly post into a Claude conversation. If Claude has no host wakeup, use an external one-shot reminder or manually reopen Claude Code after `Resume after` and continue from the checkpoint.
+
+If the local Claude Code CLI is available, an external one-shot scheduler can invoke Claude itself after recovery. Prefer the exact session id when known:
+
+```bash
+claude --resume "<session-id>" --print "Continue the interrupted task. Read /path/to/CLAUDE_QUOTA_CONTINUATION.md first, preserve its Authorization Envelope, re-check quota, then continue."
+```
+
+If the original task is the most recent Claude conversation in the same working directory:
+
+```bash
+cd "/path/to/original/workdir"
+claude --continue --print "Continue the interrupted task. Read /path/to/CLAUDE_QUOTA_CONTINUATION.md first, preserve its Authorization Envelope, re-check quota, then continue the original task without re-asking for already-granted approvals."
+```
+
+Do not use `--dangerously-skip-permissions` for quota recovery. Host-level permission prompts remain authoritative.
 
 Claude Code example:
 
