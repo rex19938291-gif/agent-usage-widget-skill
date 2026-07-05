@@ -12,6 +12,7 @@ function parseArgs(argv) {
     service: "auto",
     task: "Unspecified task",
     next: "Resume from the latest handoff/checkpoint.",
+    authorizations: [],
     notes: [],
     out: path.join(process.cwd(), "AGENT_QUOTA_CONTINUATION.md"),
   };
@@ -31,6 +32,15 @@ function parseArgs(argv) {
       i += 1;
     } else if (key === "--next" && value) {
       args.next = value;
+      i += 1;
+    } else if (key === "--authorization" && value) {
+      args.authorizations.push(value);
+      i += 1;
+    } else if (key === "--source-thread" && value) {
+      args.sourceThread = value;
+      i += 1;
+    } else if (key === "--target-thread" && value) {
+      args.targetThread = value;
       i += 1;
     } else if (key === "--note" && value) {
       args.notes.push(value);
@@ -56,6 +66,9 @@ function usage() {
     "  --service auto|codex|claude   Which quota family to prioritize in the resume hint.",
     "  --handoff <path>               Durable handoff file the next agent should read.",
     "  --note <text>                  Extra checkpoint note. Repeatable.",
+    "  --authorization <text>         Preserved task authorization note. Repeatable.",
+    "  --source-thread <id>           Optional original/source thread id.",
+    "  --target-thread <id>           Optional paused task thread id to resume.",
     "  --out <path>                   Markdown checkpoint output path.",
     "  --json                         Print machine-readable result.",
   ].join("\n");
@@ -196,12 +209,36 @@ function buildWakeupPrompt(args, outPath) {
     "",
     `1. Read this checkpoint first: ${path.resolve(outPath)}`,
     `2. ${handoffLine}`,
-    "3. Confirm current quota with /agent-usage-widget-skill before resuming high-consumption work.",
-    "4. If the relevant quota window is still under about 10%, update the checkpoint, create one new one-time wakeup for the next recovery time if the host supports it, then stop.",
-    `5. If quota recovered and no approval gate is active, continue from this next step: ${args.next}`,
-    "6. If the next step requires user approval, notify the user and stop.",
-    "7. This wakeup is one-time; do not leave a recurring automation running after it fires.",
+    "3. Read the Authorization Envelope in this checkpoint and preserve approvals already granted for the same task.",
+    "4. Confirm current quota with /agent-usage-widget-skill before resuming high-consumption work.",
+    "5. If the relevant quota window is still under about 10%, update the checkpoint, create one new one-time wakeup for the next recovery time if the host supports it, then stop.",
+    `6. If quota recovered and no new approval gate is active, continue from this next step: ${args.next}`,
+    "7. If the next step appears to require approval, first check the original thread, handoff, and Authorization Envelope. Ask the user only when the action is outside the preserved scope or the host requires a tool-level approval.",
+    "8. This wakeup is one-time; do not leave a recurring automation running after it fires.",
   ].join("\n");
+}
+
+function authorizationEnvelope(args) {
+  const lines = [
+    "This checkpoint resumes the same task, not a new task. Preserve the original task's authorization envelope from the source thread, target thread, task card, and durable handoff.",
+    "",
+    "Do not ask the user to re-approve actions already granted for this same task merely because the resume was delivered by a scheduler, automation, or another thread.",
+  ];
+  if (args.sourceThread) lines.push("", `Source thread: ${args.sourceThread}`);
+  if (args.targetThread) lines.push(`Target thread: ${args.targetThread}`);
+  lines.push("", "Preserved approvals:");
+  if (args.authorizations.length) {
+    for (const item of args.authorizations) lines.push(`- ${item}`);
+  } else {
+    lines.push("- Inspect the current thread, durable handoff, and task card for previously granted approvals before deciding an approval is missing.");
+  }
+  lines.push(
+    "",
+    "Still ask for explicit approval for new gates outside the preserved envelope, such as production changes, DNS/Cloudflare routes, deploys, public tunnels, credentials or token disclosure, sensitive/customer data, payment/order/invoice data, destructive commands, or new tool/package installs not already approved.",
+    "",
+    "Host-level sandbox, browser, filesystem, or network approval prompts are still authoritative; this checkpoint does not bypass the host's permission system."
+  );
+  return lines.join("\n");
 }
 
 function hostWakeupCompatibility() {
@@ -228,6 +265,8 @@ function buildMarkdown(args, usageResult, windows, resumeWindow) {
     `Working directory: ${cwd}`,
     `Preferred service: ${args.service}`,
     `Resume after: ${resumeWindow ? `${formatEpoch(resumeWindow.recoversAt)} (${resumeWindow.label})` : "unknown; check quota again before resuming"}`,
+    args.sourceThread ? `Source thread: ${args.sourceThread}` : null,
+    args.targetThread ? `Target thread: ${args.targetThread}` : null,
     args.handoff ? `Handoff: ${args.handoff}` : "Handoff: not provided",
     "",
     "## Quota Snapshot",
@@ -241,6 +280,10 @@ function buildMarkdown(args, usageResult, windows, resumeWindow) {
     "## Notes",
     "",
     markdownList(args.notes),
+    "",
+    "## Authorization Envelope",
+    "",
+    authorizationEnvelope(args),
     "",
     "## Local Git Status",
     "",

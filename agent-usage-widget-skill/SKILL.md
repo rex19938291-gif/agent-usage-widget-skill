@@ -68,19 +68,39 @@ node <skill-folder>/scripts/quota-continuation-checkpoint.js \
   --service auto \
   --task "<current task name>" \
   --handoff "<path to TASK_HANDOFF.md or project handoff, if any>" \
-  --next "<single concrete next step>"
+  --next "<single concrete next step>" \
+  --authorization "<approval already granted for this same task, if any>"
 ```
 
 4. Tell the user the checkpoint path and the suggested `Resume after` time from the command output.
 5. If the host provides thread wakeups, reminders, or one-time automations, create a one-time wakeup for the `Resume after` time using the `Optional One-Time Wakeup Automation Prompt` written into the checkpoint. In Codex app, prefer a thread heartbeat automation attached to the current thread; if resuming a different paused task thread, explicitly target that task thread when the host supports it. In Claude Code or Claude Desktop, use Claude's own wakeup/reminder/scheduler feature if available. Do not hand-write raw scheduler config; use the host-provided automation/reminder tool.
 6. The wakeup prompt must check quota again before continuing. If quota is still under about `10%`, it should update the checkpoint and create one new one-time wakeup for the next recovery time, then stop.
-7. The wakeup prompt must not bypass approval gates. If the recorded next step requires user approval, sensitive data, production access, browser/Chrome permission, or credentials, it should notify the user and stop.
+7. The wakeup prompt must preserve the original task's authorization envelope. If the same task thread, task card, or handoff already records approval for the next action, do not ask the user to approve the same action again merely because this is a resumed turn. Ask only when the action is outside the preserved scope or the host requires a tool-level approval.
 8. After the wakeup fires, it must end as a one-time run. Do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
 9. If no host wakeup/reminder exists, ask the user to reopen Claude/Codex after the `Resume after` time and paste/use the checkpoint's resume prompt.
 
 The default checkpoint path is `AGENT_QUOTA_CONTINUATION.md` in the current working directory. It may contain local paths and task details, so do not commit it publicly without review.
 
 Keep this separation clear: the widget reports quota state and writes the checkpoint; the host scheduler owns waking an agent or notifying the user. Without a scheduler, the mechanism is resumable but not automatic.
+
+### Preserve The Task Authorization Envelope
+
+Quota recovery resumes the same task. It should not silently shrink the task's approved scope.
+
+When creating a checkpoint, include repeatable `--authorization` notes for approvals already granted in the active task, for example:
+
+```bash
+node <skill-folder>/scripts/quota-continuation-checkpoint.js \
+  --service codex \
+  --task "Local visual parity task" \
+  --handoff "/path/to/TASK_HANDOFF.md" \
+  --next "Run the already-approved narrow visual verifier" \
+  --target-thread "<paused task thread id if known>" \
+  --authorization "Side Browser / Browser / Chrome visual verification is already approved for this task" \
+  --authorization "Work is limited to the local test site; no production deploy"
+```
+
+On resume, the agent must first read the checkpoint's `Authorization Envelope`, then the original thread or durable handoff when available. Do not re-ask for approvals that are already inside that envelope. Still stop for genuinely new gates such as production, DNS, deploys, public tunnels, credential disclosure, sensitive/customer data, payment/order/invoice data, destructive commands, or new tool/package installs that were not previously approved. Host-level permission prompts remain authoritative and cannot be bypassed by a checkpoint.
 
 ### Claude Code Notes
 

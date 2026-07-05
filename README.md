@@ -109,6 +109,22 @@ node "$HOME/.codex/skills/agent-usage-widget-skill/scripts/quota-continuation-ch
 
 預設會在目前工作目錄建立 `AGENT_QUOTA_CONTINUATION.md`。等額度回復後，開新 Claude Code 或 Codex 對話，請 agent 先讀這個 checkpoint，再讀 handoff，確認 `/agent-usage-widget-skill` 顯示額度已恢復，然後從 checkpoint 裡的下一步接續。
 
+### 保留原任務授權
+
+恢復額度後是在接續同一個任務，不是開一個全新任務。建立 checkpoint 時，可以用 `--authorization` 把原任務已授權的範圍寫進去：
+
+```bash
+node "$HOME/.codex/skills/agent-usage-widget-skill/scripts/quota-continuation-checkpoint.js" \
+  --service codex \
+  --task "目前任務名稱" \
+  --handoff "/path/to/TASK_HANDOFF.md" \
+  --next "額度恢復後第一個要做的具體步驟" \
+  --authorization "這個任務已批准使用 Browser/Chrome 做本機視覺驗證" \
+  --authorization "範圍限本機測試站，不碰正式站"
+```
+
+恢復時，agent 應先讀 checkpoint 的 `Authorization Envelope` 和原本任務 handoff。已在同一任務中授權過的本機驗證、檢查、或工具使用，不應只因為是排程喚醒就再次要求使用者批准。仍需要重新確認的是超出原範圍的新 gate，例如正式站、DNS、deploy、公開 tunnel、憑證、敏感客戶資料、付款/訂單/發票、破壞性命令，或原本沒有批准的新工具/套件安裝。系統或 host 本身跳出的權限要求仍必須遵守，checkpoint 不能繞過它。
+
 checkpoint 可能包含本機路徑與任務細節，預設已加入 `.gitignore`，不要未審閱就公開提交。
 
 ## 隱私與安全
@@ -209,6 +225,22 @@ node "$HOME/.codex/skills/agent-usage-widget-skill/scripts/quota-continuation-ch
 ```
 
 The default output is `AGENT_QUOTA_CONTINUATION.md` in the current working directory. After quota recovers, start a new Claude Code or Codex session, ask it to read that checkpoint and the durable handoff, confirm quota with `/agent-usage-widget-skill`, then continue from the recorded next step.
+
+### Preserve Existing Task Authorization
+
+Quota recovery resumes the same task; it should not turn already-approved work into a brand-new approval request. When creating a checkpoint, add repeatable `--authorization` notes for approvals already granted in the active task:
+
+```bash
+node "$HOME/.codex/skills/agent-usage-widget-skill/scripts/quota-continuation-checkpoint.js" \
+  --service codex \
+  --task "Current task name" \
+  --handoff "/path/to/TASK_HANDOFF.md" \
+  --next "First concrete step after quota recovery" \
+  --authorization "Browser/Chrome local visual verification is already approved for this task" \
+  --authorization "Scope is limited to the local test site; no production deploy"
+```
+
+On resume, the agent should read the checkpoint's `Authorization Envelope` and the original task handoff before asking for approval. Do not re-ask for the same local verification, inspection, or tool use that was already approved for the same task merely because a scheduler woke the agent. Still ask for new gates outside the preserved envelope, such as production changes, DNS, deploys, public tunnels, credential disclosure, sensitive/customer data, payment/order/invoice data, destructive commands, or new tool/package installs that were not already approved. Host-level permission prompts remain authoritative and cannot be bypassed by a checkpoint.
 
 Checkpoints may contain local paths and task details. They are ignored by this repo's `.gitignore`; review before sharing or committing them anywhere else.
 
