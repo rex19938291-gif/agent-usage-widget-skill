@@ -72,7 +72,7 @@ node <skill-folder>/scripts/quota-continuation-checkpoint.js \
 ```
 
 4. Tell the user the checkpoint path and the suggested `Resume after` time from the command output.
-5. If the host provides thread wakeups, reminders, or one-time automations, create a one-time wakeup for the `Resume after` time using the `Optional One-Time Wakeup Automation Prompt` written into the checkpoint. In Codex app, prefer a thread heartbeat automation attached to the current thread. Do not hand-write raw scheduler config; use the host-provided automation/reminder tool.
+5. If the host provides thread wakeups, reminders, or one-time automations, create a one-time wakeup for the `Resume after` time using the `Optional One-Time Wakeup Automation Prompt` written into the checkpoint. In Codex app, prefer a thread heartbeat automation attached to the current thread; if resuming a different paused task thread, explicitly target that task thread when the host supports it. In Claude Code or Claude Desktop, use Claude's own wakeup/reminder/scheduler feature if available. Do not hand-write raw scheduler config; use the host-provided automation/reminder tool.
 6. The wakeup prompt must check quota again before continuing. If quota is still under about `10%`, it should update the checkpoint and create one new one-time wakeup for the next recovery time, then stop.
 7. The wakeup prompt must not bypass approval gates. If the recorded next step requires user approval, sensitive data, production access, browser/Chrome permission, or credentials, it should notify the user and stop.
 8. After the wakeup fires, it must end as a one-time run. Do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
@@ -81,6 +81,20 @@ node <skill-folder>/scripts/quota-continuation-checkpoint.js \
 The default checkpoint path is `AGENT_QUOTA_CONTINUATION.md` in the current working directory. It may contain local paths and task details, so do not commit it publicly without review.
 
 Keep this separation clear: the widget reports quota state and writes the checkpoint; the host scheduler owns waking an agent or notifying the user. Without a scheduler, the mechanism is resumable but not automatic.
+
+### Claude Code Notes
+
+For Claude-focused work, prefer `--service claude` so the checkpoint's `Resume after` time prioritizes Claude quota windows:
+
+```bash
+node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-checkpoint.js" \
+  --service claude \
+  --task "<current Claude Code task name>" \
+  --handoff "<path to TASK_HANDOFF.md or project handoff, if any>" \
+  --next "<single concrete next step>"
+```
+
+If Claude's host does not expose a wakeup/reminder/scheduler, the checkpoint is still useful but not automatic: the user or an external scheduler must reopen Claude Code after `Resume after` and ask it to read `AGENT_QUOTA_CONTINUATION.md`. Codex app heartbeat automations can resume Codex threads, but they cannot directly post into a Claude conversation unless Claude exposes a supported bridge.
 
 ## What To Install
 

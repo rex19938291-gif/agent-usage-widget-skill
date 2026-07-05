@@ -204,6 +204,15 @@ function buildWakeupPrompt(args, outPath) {
   ].join("\n");
 }
 
+function hostWakeupCompatibility() {
+  return [
+    "- Codex app: use a one-time thread heartbeat. If resuming a different paused task thread, target that thread explicitly when the host supports `targetThreadId`.",
+    "- Claude Code / Claude Desktop: use Claude's own wakeup, reminder, or scheduler feature if the host exposes one. A Codex heartbeat cannot directly inject a follow-up into a Claude conversation.",
+    "- External scheduler: if no agent-host wakeup exists, use an external one-shot reminder or scheduler to notify the user to reopen Claude/Codex with the resume prompt. Do not install launchd/cron jobs without explicit user approval.",
+    "- Manual fallback: open a new Claude Code or Codex session after `Resume after`, read this checkpoint, read the handoff, re-check quota, and continue from `Next Step`.",
+  ].join("\n");
+}
+
 function buildMarkdown(args, usageResult, windows, resumeWindow) {
   const cwd = process.cwd();
   const gitStatus = safeReadGitStatus(cwd);
@@ -254,6 +263,10 @@ function buildMarkdown(args, usageResult, windows, resumeWindow) {
     "```text",
     buildWakeupPrompt(args, args.out),
     "```",
+    "",
+    "## Host Wakeup Compatibility",
+    "",
+    hostWakeupCompatibility(),
     "",
     "Do not commit this checkpoint publicly without reviewing it for local paths or project details.",
   ];

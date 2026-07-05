@@ -85,11 +85,13 @@ cp -R /tmp/agent-usage-widget-skill-repo/agent-usage-widget-skill "$HOME/.codex/
 
 如果目前環境支援 thread wakeup / reminder / one-time automation，agent 應在建立 checkpoint 後，同步建立一個只執行一次的排程，在 `Resume after` 時間喚醒同一個任務。這個排程醒來後要先重新查額度；如果額度仍低於約 `10%`，就更新 checkpoint 並建立下一個一次性排程，然後停止。若額度已恢復且沒有使用者 approval gate，才繼續 checkpoint 裡記錄的下一步。排程執行後應結束，不要留下常駐循環。
 
+Codex app 可用 thread heartbeat 叫醒指定 Codex thread；如果要恢復另一條暫停中的 Codex 任務，必須把 wakeup 指到那條 thread。Claude Code / Claude Desktop 則必須使用 Claude host 自己提供的 wakeup / reminder / scheduler；Codex 的 heartbeat 不能直接把 follow-up prompt 塞回 Claude 對話。如果 Claude host 沒有喚醒排程，就只能用外部一次性提醒或手動在 `Resume after` 後重新打開 Claude Code，讀 checkpoint 接續。
+
 在長任務中，agent 應在額度很低時執行：
 
 ```bash
 node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-checkpoint.js" \
-  --service auto \
+  --service claude \
   --task "目前任務名稱" \
   --handoff "/path/to/TASK_HANDOFF.md" \
   --next "額度恢復後第一個要做的具體步驟"
@@ -184,11 +186,13 @@ This skill cannot guarantee that an offline or rate-limited agent will wake itse
 
 If the host supports thread wakeups, reminders, or one-time automations, the agent should create one one-shot wakeup for the checkpoint's `Resume after` time. When it fires, it should check quota first. If the relevant quota window is still under about `10%`, it should update the checkpoint, create the next one-time wakeup for the next recovery time, and stop. If quota has recovered and no approval gate is active, it should continue from the recorded next step. The wakeup should end after it runs; do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
 
+Codex app can use thread heartbeats to wake a specific Codex thread. If the paused task is in another Codex thread, the wakeup must explicitly target that thread. Claude Code / Claude Desktop must use Claude's own wakeup, reminder, or scheduler if one is available; a Codex heartbeat cannot directly post into a Claude conversation. If Claude has no host wakeup, use an external one-shot reminder or manually reopen Claude Code after `Resume after` and continue from the checkpoint.
+
 Claude Code example:
 
 ```bash
 node "$HOME/.claude/skills/agent-usage-widget-skill/scripts/quota-continuation-checkpoint.js" \
-  --service auto \
+  --service claude \
   --task "Current task name" \
   --handoff "/path/to/TASK_HANDOFF.md" \
   --next "First concrete step after quota recovery"
