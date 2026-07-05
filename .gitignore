@@ -5,6 +5,8 @@ build/
 *.tmp
 TASK_HANDOFF.md
 CODEX_ACTIVE_TASK.md
+AGENT_QUOTA_CONTINUATION.md
+*_QUOTA_CONTINUATION.md
 截圖*
 *.png
 *.jpg

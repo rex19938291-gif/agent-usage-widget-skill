@@ -1,6 +1,6 @@
 ---
 name: agent-usage-widget-skill
-description: Install, maintain, and query a local macOS desktop widget that shows Claude and Codex quota availability. Use in Claude Code, Codex, or compatible Agent Skills clients when a user invokes /agent-usage-widget-skill, asks for current remaining Claude/Codex usage percentages, asks when usage recovers to 100%, or wants to install, update, troubleshoot, auto-start, uninstall, or package a Mac desktop usage monitor for Claude Desktop, Claude Code, Codex CLI, or Codex app usage percentages. 也適用於想在 Mac 桌面查看或直接詢問 Claude / Codex 剩餘可用額度百分比、回復 100% 時間、設定開機自動啟動、或排查 macOS Keychain 提示時。
+description: Install, maintain, and query a local macOS desktop widget that shows Claude and Codex quota availability. Use in Claude Code, Codex, or compatible Agent Skills clients when a user invokes /agent-usage-widget-skill, asks for current remaining Claude/Codex usage percentages, asks when usage recovers to 100%, wants a quota-recovery continuation checkpoint after interruption, or wants to install, update, troubleshoot, auto-start, uninstall, or package a Mac desktop usage monitor. 也適用於想在 Mac 桌面查看或直接詢問 Claude / Codex 剩餘可用額度百分比、回復 100% 時間、額度用完後如何接續任務、設定開機自動啟動、或排查 macOS Keychain 提示時。
 ---
 
 # Agent Usage Widget
@@ -22,6 +22,7 @@ Do not assume shell commands are pre-approved. Ask for or rely on the host's nor
 - 使用者想在桌面左上角查看 Claude / Codex 可用額度。
 - 使用者在手機或電腦的 Codex 對話輸入 `/agent-usage-widget-skill`，想直接知道目前剩餘幾％。
 - 使用者想用百分比而不是 token 數呈現額度。
+- 使用者想在額度低、額度用完、任務中斷前，建立可讓 Claude Code 或 Codex 之後接續的 checkpoint。
 - 使用者想設定開機自動啟動。
 - 使用者遇到 `Claude Safe Storage` 的 macOS Keychain 提示，需要你解釋 `允許` / `永遠允許` 的差異。
 - 使用者想更新、排查或移除這個本機小工具。
@@ -51,6 +52,35 @@ For an explicit live refresh, only when the user asks for it, run:
 ```bash
 node <skill-folder>/scripts/report-current-usage.js --live
 ```
+
+## Quota Recovery Continuation
+
+No skill can guarantee that an offline or rate-limited agent will automatically wake itself up later unless the host product also provides a scheduler, reminder, or automation. The reliable default is to make interruption recoverable: checkpoint the task before stopping, record the recovery time, and give the next agent a restart prompt.
+
+Use this mode when quota is very low, quota is exhausted, a long task is likely to cross a quota window, or the user asks how to continue after quota recovery.
+
+1. Run the normal quota report first.
+2. If the active quota window is under about `10%`, stop high-consumption actions such as browser screenshot matrices, large imports/exports, package installs, or broad multi-agent work.
+3. Write a local checkpoint with:
+
+```bash
+node <skill-folder>/scripts/quota-continuation-checkpoint.js \
+  --service auto \
+  --task "<current task name>" \
+  --handoff "<path to TASK_HANDOFF.md or project handoff, if any>" \
+  --next "<single concrete next step>"
+```
+
+4. Tell the user the checkpoint path and the suggested `Resume after` time from the command output.
+5. If the host provides thread wakeups, reminders, or one-time automations, create a one-time wakeup for the `Resume after` time using the `Optional One-Time Wakeup Automation Prompt` written into the checkpoint. In Codex app, prefer a thread heartbeat automation attached to the current thread. Do not hand-write raw scheduler config; use the host-provided automation/reminder tool.
+6. The wakeup prompt must check quota again before continuing. If quota is still under about `10%`, it should update the checkpoint and create one new one-time wakeup for the next recovery time, then stop.
+7. The wakeup prompt must not bypass approval gates. If the recorded next step requires user approval, sensitive data, production access, browser/Chrome permission, or credentials, it should notify the user and stop.
+8. After the wakeup fires, it must end as a one-time run. Do not leave a recurring automation running unless the user explicitly asks for recurring monitoring.
+9. If no host wakeup/reminder exists, ask the user to reopen Claude/Codex after the `Resume after` time and paste/use the checkpoint's resume prompt.
+
+The default checkpoint path is `AGENT_QUOTA_CONTINUATION.md` in the current working directory. It may contain local paths and task details, so do not commit it publicly without review.
+
+Keep this separation clear: the widget reports quota state and writes the checkpoint; the host scheduler owns waking an agent or notifying the user. Without a scheduler, the mechanism is resumable but not automatic.
 
 ## What To Install
 
@@ -95,6 +125,7 @@ $HOME/Library/LaunchAgents/com.agentusage.widget.plist
 - Use `$HOME` and runtime discovery. Do not hard-code a developer's username, absolute home path, LaunchAgent label, org ID, PID, or local project path.
 - Keep the public skill free of `allowed-tools` preapprovals or dynamic shell injection unless a maintainer deliberately reviews and accepts that broader trust model.
 - When spawning child Node processes from an agent session, avoid forwarding common agent/API token environment variables.
+- Treat quota checkpoints as local private handoffs. Do not put raw credentials, customer data, private screenshots, or unreviewed sensitive logs into them.
 - Before publishing or committing, scan the skill for private paths, tokens, cache files, screenshots, and handoff files.
 
 ## User Prompts To Explain

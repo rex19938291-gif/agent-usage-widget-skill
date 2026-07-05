@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Usage Widget"
-  short_description: "Claude/Codex quota widget and checker"
-  default_prompt: "Use $agent-usage-widget-skill to report this Mac's current Claude and Codex remaining usage percentages and recovery-to-100% times; if unavailable, explain how to install the macOS widget."
+  short_description: "Quota widget, checker, and resume checkpoint"
+  default_prompt: "Use $agent-usage-widget-skill to report this Mac's Claude/Codex remaining usage, recovery-to-100% times, and create a quota continuation checkpoint if the current task may be interrupted."
