@@ -33,6 +33,10 @@ const now = new Date();
 const nowMs = now.getTime();
 const hourStartMs = nowMs - 60 * 60 * 1000;
 const weekStartMs = startOfLocalWeek(now).getTime();
+// Codex windows are rolling (5h / 7-day). Scan session files by an 8-day lookback
+// so the newest rate-limit snapshot is found even after an idle gap or early in the
+// local week, instead of being dropped by the narrower local-week-start filter.
+const CODEX_SCAN_SINCE_MS = nowMs - 8 * 24 * 60 * 60 * 1000;
 
 function startOfLocalWeek(date) {
   const d = new Date(date);
@@ -162,7 +166,7 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
       fetchedAt: new Date().toISOString(),
       fiveHour: normalizeClaudeLimit(data.five_hour),
       weekAll: normalizeClaudeLimit(data.seven_day),
-      weekSonnet: normalizeClaudeLimit(data.seven_day_sonnet),
+      weekSonnet: normalizeClaudeLimit(pickClaudeWindow(data, "seven_day_sonnet", "sonnet")),
     };
     writeClaudeUsageCache(official);
     return { ...official, cache: "live" };
@@ -222,10 +226,40 @@ function isSafeCookieValue(value) {
 
 function normalizeClaudeLimit(limit) {
   if (!limit || typeof limit !== "object") return { usedPercent: null, resetsAt: null };
-  return {
-    usedPercent: finiteOrNull(limit.utilization ?? limit.used_percentage ?? limit.usedPercent),
-    resetsAt: parseReset(limit.resets_at ?? limit.resetsAt),
+  let usedPercent = finiteOrNull(limit.utilization ?? limit.used_percentage ?? limit.usedPercent);
+  let resetsAt = parseReset(limit.resets_at ?? limit.resetsAt);
+  // A reset already in the past means the window is back to full: report 100%
+  // available (used 0%) rather than the stale pre-reset value.
+  if (isWindowExpired(resetsAt)) {
+    usedPercent = 0;
+    resetsAt = null;
+  }
+  return { usedPercent, resetsAt };
+}
+
+function isWindowExpired(resetsAtSeconds) {
+  return Number.isFinite(resetsAtSeconds) && resetsAtSeconds * 1000 <= nowMs;
+}
+
+function pickClaudeWindow(data, exactKey, keyword) {
+  if (!data || typeof data !== "object") return null;
+  if (data[exactKey] && typeof data[exactKey] === "object") return data[exactKey];
+  for (const key of Object.keys(data)) {
+    if (key.toLowerCase().includes(keyword) && data[key] && typeof data[key] === "object") {
+      return data[key];
+    }
+  }
+  return null;
+}
+
+function normalizeExpiredRateLimits(rateLimits) {
+  if (!rateLimits || typeof rateLimits !== "object") return rateLimits;
+  const fixWindow = (window) => {
+    if (!window || typeof window !== "object") return window;
+    if (isWindowExpired(window.resets_at)) return { ...window, used_percent: 0, resets_at: null };
+    return window;
   };
+  return { ...rateLimits, primary: fixWindow(rateLimits.primary), secondary: fixWindow(rateLimits.secondary) };
 }
 
 function finiteOrNull(value) {
@@ -276,7 +310,7 @@ function writeClaudeUsageCache(official) {
 async function summarizeCodex() {
   const hour = emptyBucket();
   const week = emptyBucket();
-  const files = await walkJsonlFiles(CODEX_ROOT, weekStartMs);
+  const files = await walkJsonlFiles(CODEX_ROOT, CODEX_SCAN_SINCE_MS);
   let latestAt = 0;
   let latestRateLimits = null;
 
@@ -292,7 +326,7 @@ async function summarizeCodex() {
     });
   }
 
-  return { hour, week, latestAt, rateLimits: latestRateLimits, filesScanned: files.length };
+  return { hour, week, latestAt, rateLimits: normalizeExpiredRateLimits(latestRateLimits), filesScanned: files.length };
 }
 
 function remainingPercent(usedPercent) {
