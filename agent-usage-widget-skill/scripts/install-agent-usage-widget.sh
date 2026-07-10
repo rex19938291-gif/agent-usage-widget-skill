@@ -311,22 +311,61 @@ async function summarizeCodex() {
   const hour = emptyBucket();
   const week = emptyBucket();
   const files = await walkJsonlFiles(CODEX_ROOT, CODEX_SCAN_SINCE_MS);
-  let latestAt = 0;
-  let latestRateLimits = null;
+  // Local Codex logs can interleave rate-limit snapshots from more than one auth
+  // context (main account plus imported/delegated/auxiliary credentials). Taking
+  // the globally-latest snapshot makes the widget flip between them, so group by
+  // stream and lock onto the user's real account (the most-used active stream).
+  const streams = new Map();
 
   for (const file of files) {
     await readJsonLines(file, async (row) => {
       if (row?.payload?.type !== "token_count") return;
       const timestamp = Date.parse(row.timestamp || "");
       if (!Number.isFinite(timestamp)) return;
-      if (row.payload.rate_limits && timestamp >= latestAt) {
-        latestRateLimits = row.payload.rate_limits;
-        latestAt = timestamp;
+      if (row.payload.rate_limits) {
+        const key = codexStreamKey(row.payload.rate_limits);
+        const prev = streams.get(key);
+        if (!prev || timestamp > prev.ts) {
+          streams.set(key, { ts: timestamp, rateLimits: row.payload.rate_limits });
+        }
       }
     });
   }
 
-  return { hour, week, latestAt, rateLimits: normalizeExpiredRateLimits(latestRateLimits), filesScanned: files.length };
+  const selected = selectPrimaryCodexStream(streams);
+  return {
+    hour,
+    week,
+    latestAt: selected?.ts || 0,
+    rateLimits: normalizeExpiredRateLimits(selected?.rateLimits || null),
+    streamsConsidered: streams.size,
+    filesScanned: files.length,
+  };
+}
+
+function codexStreamKey(rateLimits) {
+  const p = rateLimits?.primary || {};
+  const s = rateLimits?.secondary || {};
+  return `${rateLimits?.plan_type || "?"}|${p.window_minutes || "?"}|${s.resets_at || "?"}`;
+}
+
+// Lock onto the user's real account: among recently-seen streams, pick the
+// most-used one (the account actually being consumed); showing the most-constrained
+// window is the safe choice for a quota widget. Falls back to all streams if none
+// are recent.
+function selectPrimaryCodexStream(streams) {
+  const ACTIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
+  const all = [...streams.values()];
+  if (!all.length) return null;
+  const recent = all.filter((s) => nowMs - s.ts <= ACTIVE_WINDOW_MS);
+  const pool = recent.length ? recent : all;
+  const usageScore = (s) => {
+    const p = s.rateLimits?.primary?.used_percent;
+    const w = s.rateLimits?.secondary?.used_percent;
+    return Math.max(Number.isFinite(p) ? p : 0, Number.isFinite(w) ? w : 0);
+  };
+  pool.sort((a, b) => usageScore(b) - usageScore(a) || b.ts - a.ts);
+  return pool[0];
 }
 
 function remainingPercent(usedPercent) {
