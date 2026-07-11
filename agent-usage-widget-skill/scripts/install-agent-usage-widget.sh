@@ -634,7 +634,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         let formatter = DateFormatter()
         formatter.locale = Locale.current
         formatter.timeZone = .current
-        formatter.dateFormat = compact ? "MMM d" : "h:mm a"
+        // 24-hour HH:mm keeps the time column compact so the minutes are never
+        // tail-truncated by the fixed-width reset label (e.g. "12:34" not "下午 12:...").
+        formatter.dateFormat = compact ? "MMM d" : "HH:mm"
         return formatter.string(from: date)
     }
 
