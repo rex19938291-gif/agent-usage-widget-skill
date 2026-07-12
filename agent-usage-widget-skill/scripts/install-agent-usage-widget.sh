@@ -28,6 +28,7 @@ const CLAUDE_COOKIE_DB = path.join(HOME, "Library", "Application Support", "Clau
 const CACHE_DIR = path.join(INSTALL_DIR, ".cache");
 const CLAUDE_USAGE_CACHE = path.join(CACHE_DIR, "claude-usage-percentages.json");
 const FORCE_CLAUDE_REFRESH = process.argv.includes("--refresh-claude");
+const QUOTA_ONLY = process.argv.includes("--quota-only");
 
 const now = new Date();
 const nowMs = now.getTime();
@@ -109,7 +110,7 @@ async function summarizeClaude() {
   const hour = emptyBucket();
   const week = emptyBucket();
   const [files, official] = await Promise.all([
-    walkJsonlFiles(CLAUDE_ROOT, weekStartMs),
+    QUOTA_ONLY ? Promise.resolve([]) : walkJsonlFiles(CLAUDE_ROOT, weekStartMs),
     fetchClaudeOfficialUsage({ force: FORCE_CLAUDE_REFRESH }),
   ]);
   const seen = new Set();
@@ -252,14 +253,10 @@ function pickClaudeWindow(data, exactKey, keyword) {
   return null;
 }
 
-function normalizeExpiredRateLimits(rateLimits) {
-  if (!rateLimits || typeof rateLimits !== "object") return rateLimits;
-  const fixWindow = (window) => {
-    if (!window || typeof window !== "object") return window;
-    if (isWindowExpired(window.resets_at)) return { ...window, used_percent: 0, resets_at: null };
-    return window;
-  };
-  return { ...rateLimits, primary: fixWindow(rateLimits.primary), secondary: fixWindow(rateLimits.secondary) };
+function applyWindowExpiry(window) {
+  if (!window || typeof window !== "object") return window;
+  if (isWindowExpired(window.resets_at)) return { ...window, used_percent: 0, resets_at: null };
+  return window;
 }
 
 function finiteOrNull(value) {
@@ -310,12 +307,16 @@ function writeClaudeUsageCache(official) {
 async function summarizeCodex() {
   const hour = emptyBucket();
   const week = emptyBucket();
-  const files = await walkJsonlFiles(CODEX_ROOT, CODEX_SCAN_SINCE_MS);
-  // Local Codex logs can interleave rate-limit snapshots from more than one auth
-  // context (main account plus imported/delegated/auxiliary credentials). Taking
-  // the globally-latest snapshot makes the widget flip between them, so group by
-  // stream and lock onto the user's real account (the most-used active stream).
-  const streams = new Map();
+  let files = await walkJsonlFiles(CODEX_ROOT, QUOTA_ONLY ? nowMs - 12 * 60 * 60 * 1000 : CODEX_SCAN_SINCE_MS);
+  if (QUOTA_ONLY && files.length === 0) files = await walkJsonlFiles(CODEX_ROOT, CODEX_SCAN_SINCE_MS);
+  // Codex writes rate-limit snapshots in inconsistent shapes: the 5-hour and weekly
+  // windows are NOT always in fixed primary/secondary slots, some records carry only
+  // one window, and multiple auth contexts interleave. Classify every window by its
+  // window_minutes and collect 5-hour and weekly readings independently, then lock
+  // each onto the main account (most-used recent reading). Immune to slot swaps,
+  // partial records, and account flip-flop.
+  const fiveHourReadings = [];
+  const weeklyReadings = [];
 
   for (const file of files) {
     await readJsonLines(file, async (row) => {
@@ -323,49 +324,81 @@ async function summarizeCodex() {
       const timestamp = Date.parse(row.timestamp || "");
       if (!Number.isFinite(timestamp)) return;
       if (row.payload.rate_limits) {
-        const key = codexStreamKey(row.payload.rate_limits);
-        const prev = streams.get(key);
-        if (!prev || timestamp > prev.ts) {
-          streams.set(key, { ts: timestamp, rateLimits: row.payload.rate_limits });
-        }
+        collectCodexWindows(row.payload.rate_limits, timestamp, fiveHourReadings, weeklyReadings);
       }
     });
   }
 
-  const selected = selectPrimaryCodexStream(streams);
+  const five = pickCurrentReading(fiveHourReadings);
+  const weekly = pickCurrentReading(weeklyReadings);
   return {
     hour,
     week,
-    latestAt: selected?.ts || 0,
-    rateLimits: normalizeExpiredRateLimits(selected?.rateLimits || null),
-    streamsConsidered: streams.size,
+    latestAt: Math.max(five?.ts || 0, weekly?.ts || 0),
+    rateLimits: buildCodexRateLimits(five, weekly),
+    fiveHourReadings: fiveHourReadings.length,
+    weeklyReadings: weeklyReadings.length,
     filesScanned: files.length,
   };
 }
 
-function codexStreamKey(rateLimits) {
-  const p = rateLimits?.primary || {};
-  const s = rateLimits?.secondary || {};
-  return `${rateLimits?.plan_type || "?"}|${p.window_minutes || "?"}|${s.resets_at || "?"}`;
+// Classify a rate-limit window by window_minutes: ~5 hours (<= 360) vs weekly
+// (>= 3 days). Returns null without a usable percentage so partial/garbled records
+// contribute nothing rather than corrupting a slot.
+function classifyCodexWindow(window) {
+  if (!window || typeof window !== "object") return null;
+  const used = window.used_percent;
+  if (!Number.isFinite(used)) return null;
+  const wm = Number(window.window_minutes);
+  if (!Number.isFinite(wm)) return null;
+  if (wm <= 360) return { kind: "five", used_percent: used, resets_at: window.resets_at };
+  if (wm >= 4320) return { kind: "week", used_percent: used, resets_at: window.resets_at };
+  return null;
 }
 
-// Lock onto the user's real account: among recently-seen streams, pick the
-// most-used one (the account actually being consumed); showing the most-constrained
-// window is the safe choice for a quota widget. Falls back to all streams if none
-// are recent.
-function selectPrimaryCodexStream(streams) {
+// Codex does not reliably keep 5h in primary and weekly in secondary, so read every
+// slot and route by classification instead of position.
+function collectCodexWindows(rateLimits, ts, fiveHourReadings, weeklyReadings) {
+  for (const slot of [rateLimits?.primary, rateLimits?.secondary]) {
+    const c = classifyCodexWindow(slot);
+    if (!c) continue;
+    const reading = { ts, used_percent: c.used_percent, resets_at: c.resets_at };
+    (c.kind === "five" ? fiveHourReadings : weeklyReadings).push(reading);
+  }
+}
+
+// Report the account's CURRENT window while resisting multi-account flip-flop. The
+// local logs interleave several rate-limit streams (main account plus stale or
+// auxiliary ones). Anchor on the newest reading and look only at readings written in
+// the ~90s around it — the actively-used account writes every few seconds, so a
+// stream that stopped writing minutes ago (a stale/previous window) falls out of
+// this tight cluster. Within the cluster take the most-used, so a genuinely
+// concurrent auxiliary credential's momentary 0% cannot mask the real high reading.
+function pickCurrentReading(readings) {
+  if (!readings.length) return null;
   const ACTIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
-  const all = [...streams.values()];
-  if (!all.length) return null;
-  const recent = all.filter((s) => nowMs - s.ts <= ACTIVE_WINDOW_MS);
-  const pool = recent.length ? recent : all;
-  const usageScore = (s) => {
-    const p = s.rateLimits?.primary?.used_percent;
-    const w = s.rateLimits?.secondary?.used_percent;
-    return Math.max(Number.isFinite(p) ? p : 0, Number.isFinite(w) ? w : 0);
+  const CLUSTER_MS = 90 * 1000;
+  const recent = readings.filter((r) => nowMs - r.ts <= ACTIVE_WINDOW_MS);
+  const pool = recent.length ? recent : readings;
+  const newestTs = Math.max(...pool.map((r) => r.ts));
+  const cluster = pool.filter((r) => newestTs - r.ts <= CLUSTER_MS);
+  cluster.sort((a, b) => b.used_percent - a.used_percent || b.ts - a.ts);
+  return cluster[0];
+}
+
+function buildCodexRateLimits(five, weekly) {
+  const toWindow = (reading, windowMinutes) => {
+    if (!reading) return null;
+    return applyWindowExpiry({
+      used_percent: reading.used_percent,
+      resets_at: reading.resets_at,
+      window_minutes: windowMinutes,
+    });
   };
-  pool.sort((a, b) => usageScore(b) - usageScore(a) || b.ts - a.ts);
-  return pool[0];
+  const primary = toWindow(five, 300);
+  const secondary = toWindow(weekly, 10080);
+  if (!primary && !secondary) return null;
+  return { primary, secondary };
 }
 
 function remainingPercent(usedPercent) {
@@ -377,19 +410,20 @@ function formatPercent(value) {
   return Number.isFinite(value) ? `${Math.round(value)}%` : "n/a";
 }
 
-function formatReset(epochSeconds) {
+function formatReset(epochSeconds, compact = false) {
   if (!epochSeconds) return "n/a";
   const date = new Date(epochSeconds * 1000);
+  if (compact) return date.toLocaleString("zh-TW", { month: "numeric", day: "numeric" });
   const sameDay = date.toDateString() === new Date().toDateString();
   return date.toLocaleString("zh-TW", sameDay
     ? { hour: "numeric", minute: "2-digit", hour12: false }
-    : { month: "numeric", day: "numeric" });
+    : { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
-function recoveryText(epochSeconds, remainingPercent) {
+function recoveryText(epochSeconds, remainingPercent, compact = false) {
   if (Number.isFinite(remainingPercent) && Math.round(remainingPercent) >= 100) return "已是 100%";
   if (!Number.isFinite(epochSeconds)) return "回復 100%：n/a";
-  return `回復 100%：${formatReset(epochSeconds)}`;
+  return `回復 100%：${formatReset(epochSeconds, compact)}`;
 }
 
 function buildText(summary) {
@@ -403,11 +437,11 @@ function buildText(summary) {
   return [
     "Codex 可用額度",
     `5 小時 ${formatPercent(codexPrimaryRemaining)} ${recoveryText(x.rateLimits?.primary?.resets_at, codexPrimaryRemaining)}`,
-    `1 週 ${formatPercent(codexSecondaryRemaining)} ${recoveryText(x.rateLimits?.secondary?.resets_at, codexSecondaryRemaining)}`,
+    `1 週 ${formatPercent(codexSecondaryRemaining)} ${recoveryText(x.rateLimits?.secondary?.resets_at, codexSecondaryRemaining, true)}`,
     "Claude 可用額度",
     `5 小時 ${formatPercent(claudeFiveRemaining)} ${recoveryText(c.official?.fiveHour?.resetsAt, claudeFiveRemaining)}`,
-    `1 週 ${formatPercent(claudeWeekRemaining)} ${recoveryText(c.official?.weekAll?.resetsAt, claudeWeekRemaining)}`,
-    `Sonnet ${formatPercent(claudeSonnetRemaining)} ${recoveryText(c.official?.weekSonnet?.resetsAt, claudeSonnetRemaining)}`,
+    `1 週 ${formatPercent(claudeWeekRemaining)} ${recoveryText(c.official?.weekAll?.resetsAt, claudeWeekRemaining, true)}`,
+    `Sonnet ${formatPercent(claudeSonnetRemaining)} ${recoveryText(c.official?.weekSonnet?.resetsAt, claudeSonnetRemaining, true)}`,
   ].join("\n");
 }
 
@@ -579,7 +613,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = forceClaude ? ["node", self.scriptPath, "--refresh-claude"] : ["node", self.scriptPath]
+            process.arguments = forceClaude ? ["node", self.scriptPath, "--quota-only", "--refresh-claude"] : ["node", self.scriptPath, "--quota-only"]
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = Pipe()
