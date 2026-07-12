@@ -346,7 +346,10 @@ async function summarizeCodex() {
 function codexStreamKey(rateLimits) {
   const p = rateLimits?.primary || {};
   const s = rateLimits?.secondary || {};
-  return `${rateLimits?.plan_type || "?"}|${p.window_minutes || "?"}|${s.resets_at || "?"}`;
+  const resetBucket = Number.isFinite(s.resets_at)
+    ? Math.round(s.resets_at / (15 * 60)) * (15 * 60)
+    : "?";
+  return `${rateLimits?.plan_type || "?"}|${p.window_minutes || "?"}|${resetBucket}`;
 }
 
 // Lock onto the user's real account: among recently-seen streams, pick the
@@ -354,14 +357,15 @@ function codexStreamKey(rateLimits) {
 // window is the safe choice for a quota widget. Falls back to all streams if none
 // are recent.
 function selectPrimaryCodexStream(streams) {
-  const ACTIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
   const all = [...streams.values()];
   if (!all.length) return null;
-  const recent = all.filter((s) => nowMs - s.ts <= ACTIVE_WINDOW_MS);
-  const pool = recent.length ? recent : all;
+  const freshestTs = Math.max(...all.map((s) => s.ts));
+  const FRESH_COHORT_MS = 10 * 60 * 1000;
+  const pool = all.filter((s) => freshestTs - s.ts <= FRESH_COHORT_MS);
   const usageScore = (s) => {
-    const p = s.rateLimits?.primary?.used_percent;
-    const w = s.rateLimits?.secondary?.used_percent;
+    const normalized = normalizeExpiredRateLimits(s.rateLimits);
+    const p = normalized?.primary?.used_percent;
+    const w = normalized?.secondary?.used_percent;
     return Math.max(Number.isFinite(p) ? p : 0, Number.isFinite(w) ? w : 0);
   };
   pool.sort((a, b) => usageScore(b) - usageScore(a) || b.ts - a.ts);
