@@ -769,13 +769,30 @@ fi
 NODE_BIN=""
 NODE_UNTESTED=0
 for candidate in "${NODE_CANDIDATES[@]}"; do
-  probe="$("$candidate" "$INSTALL_DIR/scripts/usage-summary.js" --quota-only --refresh-claude 2>/dev/null || true)"
+  # Read the verdict out of the claude block alone. --refresh-claude also forces a live
+  # codex fetch, so matching the whole document as a string sees codex's status too and
+  # would accept a node that claude rejects with HTTP 403 whenever codex happens to answer.
+  probe="$("$candidate" "$INSTALL_DIR/scripts/usage-summary.js" --quota-only --refresh-claude 2>/dev/null \
+    | "$candidate" -e '
+let raw = "";
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const official = JSON.parse(raw).claude.official;
+    if (official.available !== true) return console.log(String(official.error || "unknown"));
+    // A stale cache answers even when the live fetch threw, so it proves nothing here.
+    console.log(official.cache === "stale" ? "stale" : "available");
+  } catch (error) {
+    console.log("unreadable");
+  }
+});
+' 2>/dev/null || true)"
   case "$probe" in
-    *'"available": true'*) NODE_BIN="$candidate"; break ;;
+    available) NODE_BIN="$candidate"; break ;;
     # No local Claude session to verify against (not signed in to Claude Desktop, or
-    # Keychain access declined). Claude percentages are untestable either way, so any
-    # working node is equally good — take it and stop probing.
-    *missing_session*|*manual_refresh_required*) NODE_BIN="$candidate"; NODE_UNTESTED=1; break ;;
+    # Keychain access declined), or only a stale cache to answer from. Claude percentages
+    # are untestable either way, so any working node is equally good — stop probing.
+    missing_session|manual_refresh_required|stale) NODE_BIN="$candidate"; NODE_UNTESTED=1; break ;;
   esac
 done
 
