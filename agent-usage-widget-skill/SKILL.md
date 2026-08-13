@@ -149,43 +149,73 @@ Do not use `--dangerously-skip-permissions` for quota recovery. Host-level permi
 
 ## What To Install
 
-Run the bundled installer:
+There are two installation channels, and **checking which one is in use comes first**.
+Running the source installer on a machine that already has the packaged app produces two
+parallel installs fighting over one LaunchAgent label:
+
+```bash
+[ -d /Applications/AgentUsageWidget.app ] && echo packaged || echo not-packaged
+```
+
+**Packaged** (installed from `.dmg` / `.pkg`) — the app carries its own Node and its own copy
+of `usage-summary.js`. Do **not** run the source installer. Everything is available either
+from the widget's right-click menu or as a command:
+
+```bash
+A=/Applications/AgentUsageWidget.app/Contents/MacOS/AgentUsageWidget
+"$A" --status               # resolved node/script paths, language, login-item state
+"$A" --enable-login-item    # or --disable-login-item
+"$A" --install-skill        # refresh this skill from the app bundle
+"$A" --check-layout         # verify no label overflows its column in either language
+```
+
+**Source** — run the bundled installer, which compiles with `swiftc` and probes for a usable
+Node:
 
 ```bash
 bash <skill-folder>/scripts/install-agent-usage-widget.sh
 ```
 
-The installer writes the app to:
-
-```text
-$HOME/.agent-usage-widget
-```
-
-It creates a user LaunchAgent at:
-
-```text
-$HOME/Library/LaunchAgents/com.agentusage.widget.plist
-```
+It writes the app to `$HOME/.agent-usage-widget` and creates a user LaunchAgent at
+`$HOME/Library/LaunchAgents/com.agentusage.widget.plist`. The packaged channel uses the same
+LaunchAgent label but points it at `/Applications`.
 
 ## Data Sources
 
-- Codex: local `$HOME/.codex/sessions/**/*.jsonl` rate-limit records.
-- Claude: local Claude Desktop cookie store plus macOS Keychain entry `Claude Safe Storage`, used only in memory to query the official `https://claude.ai/api/organizations/<org_uuid>/usage` endpoint.
-- Claude fallback: if Claude Desktop is not installed, not logged in, or Keychain access is denied, show unavailable Claude percentages without crashing.
+Both services are read live from the same endpoints their own apps use, with a local
+fallback when there is no usable login.
+
+- Codex: `https://chatgpt.com/backend-api/codex/usage`, authorized with the OAuth
+  `access_token` and `account_id` from `$HOME/.codex/auth.json`.
+- Codex fallback: rate-limit records in `$HOME/.codex/sessions/**/*.jsonl`. These are
+  written **only while the Codex CLI runs** — the desktop app keeps its limits in memory —
+  so they can be many hours stale. Report their age; never present them as live.
+- Claude: `https://claude.ai/api/organizations/<org_uuid>/usage`, authorized with the
+  Claude Desktop cookie store plus the macOS Keychain entry `Claude Safe Storage`.
+- Claude fallback: the widget's last cached percentages. If Claude Desktop is absent, not
+  logged in, or Keychain access is denied, report Claude as unavailable without crashing.
+
+Windows are identified by their **duration**, never by their position in the response.
+Neither API keeps a fixed slot per window: on a Codex plan with no 5-hour limit,
+`primary_window` is the weekly one and `secondary_window` is null.
 
 ## 顯示方式
 
-- Codex：顯示 `5 小時` 與 `1 週` 可用額度百分比。
-- Claude：顯示 `5 小時`、`1 週` 與 `Sonnet` 可用額度百分比。
-- 百分比代表可用額度，不是已使用額度。
+- Codex：`5 小時` 與 `1 週`。若方案本身沒有 5 小時視窗，顯示「此方案無此限制」，不要顯示為讀取失敗。
+- Claude：`5 小時`、`1 週`，以及方案綁定的單一模型週視窗。該模型名稱由 API 決定（例如 `Fable` 或 `Sonnet`），不可寫死。
+- 百分比代表**可用**額度，不是已使用額度。
 - 對話查詢應同時顯示查詢時間、資料生成時間，以及各窗口回復 100% 的時間；如果已是 100%，直接標示已是 100%。
-- 小工具應維持低干擾桌面層級；一般 App 視窗可以覆蓋它。
-- Claude 官方用量每 60 秒強制刷新一次。
+- 小工具本身支援繁體中文與英文（右鍵選單切換，預設跟隨系統語言）。面板是固定像素格線，
+  較長的字串會被靜默截斷成 `…` 而不是換行；改動任何面板字串後要跑 `--check-layout` 確認。
+- 小工具維持低干擾桌面層級；一般 App 視窗可以覆蓋它。只有右上角的重新整理圖示可點擊，其餘區域點擊穿透。
+- 每 60 秒自動刷新，使用者也可點右上角圖示立即刷新。
 
 ## Safety Rules
 
-- Do not print, log, cache, or save Claude cookies, tokens, organization IDs, or Keychain secrets.
-- Use Claude cookies, tokens, and organization IDs only for the official Claude usage API request; never send them to third-party services.
+- Do not print, log, cache, or save Claude cookies, organization IDs, Keychain secrets, or
+  the Codex OAuth tokens in `$HOME/.codex/auth.json`.
+- Send that login material only to the service's own official usage endpoint, never to any
+  third party.
 - Cache only non-sensitive usage percentages and timestamps.
 - Use `$HOME` and runtime discovery. Do not hard-code a developer's username, absolute home path, LaunchAgent label, org ID, PID, or local project path.
 - Keep the public skill free of `allowed-tools` preapprovals or dynamic shell injection unless a maintainer deliberately reviews and accepts that broader trust model.
@@ -209,10 +239,53 @@ If macOS asks whether `security` may access `Claude Safe Storage`, explain:
 
 After install or update, run:
 
+Packaged install:
+
+```bash
+A=/Applications/AgentUsageWidget.app
+launchctl list | grep com.agentusage.widget
+"$A/Contents/Resources/node" "$A/Contents/Resources/usage-summary.js" \
+  --quota-only --refresh --text
+```
+
+Source install:
+
 ```bash
 bash "$HOME/.agent-usage-widget/run-widget.sh"
 launchctl list | grep com.agentusage.widget
-node "$HOME/.agent-usage-widget/scripts/usage-summary.js" --text
+"$(cat "$HOME/.agent-usage-widget/node-path")" \
+  "$HOME/.agent-usage-widget/scripts/usage-summary.js" --quota-only --refresh --text
 ```
 
+Never invoke a bare `node` from PATH. Use the interpreter the install recorded — `node-path`
+for a source install, the bundled binary for a packaged one. The Claude endpoint rejects some
+Node builds outright with HTTP 403 while accepting others with identical cookies, and the
+cutoff does not follow the version numbering (measured 2026-08-13: 22.17.0–22.19.0 return
+200; 22.20.0, 22.22.0, 22.23.2 and 25.x return 403). A launchd-started app also gets a PATH
+with no `node` in it at all.
+
+`--text` accepts `--lang=zh|en`; the JSON output is language-neutral.
+
 Use `plutil -lint "$HOME/Library/LaunchAgents/com.agentusage.widget.plist"` to validate auto-start.
+
+## Uninstall
+
+These commands cover both channels. The last two apply only to a packaged install, whose app
+is owned by root and whose `.pkg` receipt therefore needs `sudo`:
+
+```bash
+launchctl bootout "gui/$(id -u)/com.agentusage.widget" 2>/dev/null || true
+pkill -x AgentUsageWidget 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/com.agentusage.widget.plist"
+rm -rf "$HOME/.agent-usage-widget"
+rm -rf "$HOME/.claude/skills/agent-usage-widget-skill" "$HOME/.codex/skills/agent-usage-widget-skill"
+defaults delete com.agentusage.widget 2>/dev/null || true
+# packaged install only; the .pkg one is owned by root
+sudo rm -rf /Applications/AgentUsageWidget.app
+sudo pkgutil --forget com.agentusage.widget.pkg 2>/dev/null || true
+```
+
+Deleting the cloned repository does **not** uninstall anything: installing copies files into
+`$HOME` and, for the packaged channel, `/Applications`. The widget has no Dock icon or menu
+bar item (`LSUIElement`), so it cannot be quit from the app switcher — use its right-click
+menu, or `pkill -x AgentUsageWidget`.

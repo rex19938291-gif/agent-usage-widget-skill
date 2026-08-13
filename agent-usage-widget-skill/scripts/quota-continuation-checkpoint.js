@@ -95,7 +95,9 @@ function sanitizedEnv() {
 
 function readUsageSummary() {
   try {
-    const raw = execFileSync("node", [REPORT_SCRIPT, "--json"], {
+    // process.execPath, not "node": PATH may hold a build the Claude usage endpoint
+    // rejects, while this interpreter is already known to run.
+    const raw = execFileSync(process.execPath, [REPORT_SCRIPT, "--json"], {
       encoding: "utf8",
       env: sanitizedEnv(),
       timeout: 17000,
@@ -143,9 +145,11 @@ function windowsFromSummary(summary) {
     },
     {
       service: "claude",
-      label: "Claude Sonnet",
-      remaining: remainingFromUsed(claude.weekSonnet?.usedPercent),
-      recoversAt: claude.weekSonnet?.resetsAt,
+      // The weekly per-model window is plan-scoped (Fable, Sonnet, ...); weekSonnet is
+      // the older cache shape kept so pre-existing caches still yield a reading.
+      label: `Claude ${claude.weekScoped?.label || "Sonnet"}`,
+      remaining: remainingFromUsed((claude.weekScoped || claude.weekSonnet)?.usedPercent),
+      recoversAt: (claude.weekScoped || claude.weekSonnet)?.resetsAt,
     },
   ];
 }
