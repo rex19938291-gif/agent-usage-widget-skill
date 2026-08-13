@@ -9,6 +9,17 @@ const forceLive = process.argv.includes("--live") || process.argv.includes("--re
 const jsonOutput = process.argv.includes("--json");
 const debugOutput = process.argv.includes("--debug");
 
+// The packaged .app keeps usage-summary.js and its own node side by side in Resources/,
+// mirroring what main.swift resolves through Bundle.main.resourceURL. A .pkg lands in
+// /Applications; a .dmg dragged by a non-admin can land in ~/Applications.
+function packagedResourceDirs() {
+  const dirs = ["/Applications"];
+  if (HOME) dirs.push(path.join(HOME, "Applications"));
+  return dirs.map((dir) =>
+    path.join(dir, "AgentUsageWidget.app", "Contents", "Resources")
+  );
+}
+
 function candidateSummaryScripts() {
   const candidates = [];
   if (process.env.AGENT_USAGE_WIDGET_SUMMARY) {
@@ -21,6 +32,9 @@ function candidateSummaryScripts() {
     candidates.push(path.join(HOME, ".agent-usage-widget", "scripts", "usage-summary.js"));
     candidates.push(path.join(HOME, "agent-usage-widget", "scripts", "usage-summary.js"));
   }
+  for (const dir of packagedResourceDirs()) {
+    candidates.push(path.join(dir, "usage-summary.js"));
+  }
   return [...new Set(candidates)];
 }
 
@@ -32,6 +46,32 @@ function findSummaryScript() {
       return false;
     }
   });
+}
+
+// Never resolve `node` from PATH: the Claude usage endpoint rejects some builds outright
+// (node 25 gets HTTP 403 where node 20/22 get 200), so reuse the interpreter the installer
+// verified. Falls back to the one running this script, which is at least known to exist.
+function resolveNodeBinary(summaryScript) {
+  const candidates = [process.env.AGENT_USAGE_WIDGET_NODE];
+  if (summaryScript) {
+    const recorded = path.join(path.dirname(path.dirname(summaryScript)), "node-path");
+    try {
+      candidates.push(fs.readFileSync(recorded, "utf8").trim());
+    } catch {}
+    // Packaged channel: the vetted node sits next to the summary script in Resources/ and
+    // there is no node-path file. Without this, a packaged install would fall through to
+    // process.execPath — which may well be a build the Claude endpoint answers with 403.
+    candidates.push(path.join(path.dirname(summaryScript), "node"));
+  }
+  candidates.push(process.execPath);
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return "node";
 }
 
 function remainingPercentFromUsed(used) {
@@ -48,8 +88,8 @@ function recoveryText(epochSeconds, remainingPercent) {
   const date = new Date(epochSeconds * 1000);
   const sameDay = date.toDateString() === new Date().toDateString();
   const formatted = date.toLocaleString("zh-TW", sameDay
-    ? { hour: "numeric", minute: "2-digit", hour12: false }
-    : { month: "numeric", day: "numeric" });
+    ? { hour: "numeric", minute: "2-digit", hourCycle: "h23" }
+    : { month: "2-digit", day: "2-digit" });
   return `，回復 100%：${formatted}`;
 }
 
@@ -62,7 +102,9 @@ function formatLocalDateTime(date = new Date()) {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false,
+    // hourCycle rather than hour12: with hour12 present ICU ignores hourCycle and
+    // renders midnight as 24:00 in zh-TW.
+    hourCycle: "h23",
   }).formatToParts(date);
   const value = (type) => parts.find((part) => part.type === type)?.value || "00";
   return `${value("year")}-${value("month")}-${value("day")} ${value("hour")}:${value("minute")}:${value("second")}`;
@@ -71,7 +113,22 @@ function formatLocalDateTime(date = new Date()) {
 function formatGeneratedAt(isoString) {
   const date = new Date(isoString);
   if (!Number.isFinite(date.getTime())) return "未知";
-  return date.toLocaleString("zh-TW", { hour: "numeric", minute: "2-digit", hour12: false });
+  return date.toLocaleString("zh-TW", { hour: "numeric", minute: "2-digit", hourCycle: "h23" });
+}
+
+// Codex rate-limit snapshots are written only while the Codex CLI runs — the desktop app
+// keeps its own in memory — so a reading can be hours old and disagree with the app.
+// State the age rather than passing a stale number off as current.
+function codexAgeNote(...windows) {
+  const stamps = windows.map((w) => w?.observed_at).filter((v) => Number.isFinite(v));
+  if (!stamps.length) return "";
+  const ageMs = Date.now() - Math.max(...stamps) * 1000;
+  if (ageMs <= 15 * 60 * 1000) return "";
+  const minutes = Math.round(ageMs / 60000);
+  if (minutes < 60) return `（${minutes} 分鐘前資料）`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `（${hours} 小時前資料）`;
+  return `（${Math.round(hours / 24)} 天前資料）`;
 }
 
 function buildReport(summary, source) {
@@ -82,20 +139,28 @@ function buildReport(summary, source) {
   const codexSecondaryRemaining = remainingPercentFromUsed(codexSecondary?.used_percent);
   const claudeFiveRemaining = remainingPercentFromUsed(claude?.fiveHour?.usedPercent);
   const claudeWeekRemaining = remainingPercentFromUsed(claude?.weekAll?.usedPercent);
-  const claudeSonnetRemaining = remainingPercentFromUsed(claude?.weekSonnet?.usedPercent);
+  // The weekly per-model window is whatever the plan scopes it to (Fable, Sonnet, ...),
+  // so both the value and its label come from the data. weekSonnet is the older shape.
+  const claudeScoped = claude?.weekScoped || claude?.weekSonnet;
+  const claudeScopedRemaining = remainingPercentFromUsed(claudeScoped?.usedPercent);
+  const claudeScopedLabel = claude?.weekScoped?.label || "Sonnet";
   const lines = [
     "目前剩餘用量",
     `查詢時間：${formatLocalDateTime(new Date())}`,
     `資料生成：${formatGeneratedAt(summary.generatedAt)}`,
     "",
-    "Codex",
-    `- 5 小時：${percent(codexPrimaryRemaining)}${recoveryText(codexPrimary?.resets_at, codexPrimaryRemaining)}`,
+    `Codex${codexAgeNote(codexPrimary, codexSecondary)}`,
+    // "no such window on this plan" is a different fact from "could not read it"; the live
+    // endpoint reports the absent window explicitly, so don't blur them into 無法取得.
+    summary.codex?.official?.available === true && !summary.codex.official.fiveHour
+      ? "- 5 小時：此方案無此限制"
+      : `- 5 小時：${percent(codexPrimaryRemaining)}${recoveryText(codexPrimary?.resets_at, codexPrimaryRemaining)}`,
     `- 1 週：${percent(codexSecondaryRemaining)}${recoveryText(codexSecondary?.resets_at, codexSecondaryRemaining)}`,
     "",
     "Claude",
     `- 5 小時：${percent(claudeFiveRemaining)}${recoveryText(claude?.fiveHour?.resetsAt, claudeFiveRemaining)}`,
     `- 1 週：${percent(claudeWeekRemaining)}${recoveryText(claude?.weekAll?.resetsAt, claudeWeekRemaining)}`,
-    `- Sonnet：${percent(claudeSonnetRemaining)}${recoveryText(claude?.weekSonnet?.resetsAt, claudeSonnetRemaining)}`,
+    `- ${claudeScopedLabel}：${percent(claudeScopedRemaining)}${recoveryText(claudeScoped?.resetsAt, claudeScopedRemaining)}`,
   ];
   if (forceLive && summary.claude?.official?.cache === "stale") {
     lines.push("", "Claude 即時刷新暫時失敗，已改用小工具最近一次快取資料。");
@@ -137,7 +202,7 @@ function main() {
   if (forceLive) args.push("--refresh-claude");
   let raw;
   try {
-    raw = execFileSync("node", args, {
+    raw = execFileSync(resolveNodeBinary(summaryScript), args, {
       encoding: "utf8",
       env: sanitizedEnv(),
       timeout: 15000,
