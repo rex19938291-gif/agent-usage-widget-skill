@@ -82,7 +82,11 @@ function percent(value) {
   return Number.isFinite(value) ? `${Math.round(value)}%` : "無法取得";
 }
 
-function recoveryText(epochSeconds, remainingPercent) {
+function recoveryText(epochSeconds, remainingPercent, preferReset = false) {
+  if (preferReset) {
+    if (!Number.isFinite(epochSeconds)) return "，回復 100%：無法取得";
+    return `，回復 100%：${formatLocalDateTime(new Date(epochSeconds * 1000))}`;
+  }
   if (Number.isFinite(remainingPercent) && Math.round(remainingPercent) >= 100) return "，已是 100%";
   if (!Number.isFinite(epochSeconds)) return "，回復 100%：無法取得";
   const date = new Date(epochSeconds * 1000);
@@ -154,13 +158,13 @@ function buildReport(summary, source) {
     // endpoint reports the absent window explicitly, so don't blur them into 無法取得.
     summary.codex?.official?.available === true && !summary.codex.official.fiveHour
       ? "- 5 小時：此方案無此限制"
-      : `- 5 小時：${percent(codexPrimaryRemaining)}${recoveryText(codexPrimary?.resets_at, codexPrimaryRemaining)}`,
+      : `- 5 小時：${percent(codexPrimaryRemaining)}${recoveryText(codexPrimary?.resets_at, codexPrimaryRemaining, true)}`,
     `- 1 週：${percent(codexSecondaryRemaining)}${recoveryText(codexSecondary?.resets_at, codexSecondaryRemaining)}`,
     "",
     "Claude",
-    `- 5 小時：${percent(claudeFiveRemaining)}${recoveryText(claude?.fiveHour?.resetsAt, claudeFiveRemaining)}`,
-    `- 1 週：${percent(claudeWeekRemaining)}${recoveryText(claude?.weekAll?.resetsAt, claudeWeekRemaining)}`,
-    `- ${claudeScopedLabel}：${percent(claudeScopedRemaining)}${recoveryText(claudeScoped?.resetsAt, claudeScopedRemaining)}`,
+    `- 5 小時：${percent(claudeFiveRemaining)}${recoveryText(claude?.fiveHour?.resetsAt, claudeFiveRemaining, true)}`,
+    `- 1 週：${percent(claudeWeekRemaining)}${recoveryText(claude?.weekAll?.resetsAt, claudeWeekRemaining, true)}`,
+    `- ${claudeScopedLabel}：${percent(claudeScopedRemaining)}${recoveryText(claudeScoped?.resetsAt, claudeScopedRemaining, true)}`,
   ];
   if (forceLive && summary.claude?.official?.cache === "stale") {
     lines.push("", "Claude 即時刷新暫時失敗，已改用小工具最近一次快取資料。");
@@ -198,8 +202,10 @@ function main() {
     process.exit(2);
   }
 
-  const args = [summaryScript];
-  if (forceLive) args.push("--refresh-claude");
+  // A quota query should read only quota/cache data. Scanning the full Claude and Codex
+  // conversation histories can exceed this wrapper's timeout and is unnecessary here.
+  const args = [summaryScript, "--quota-only"];
+  if (forceLive) args.push("--refresh");
   let raw;
   try {
     raw = execFileSync(resolveNodeBinary(summaryScript), args, {

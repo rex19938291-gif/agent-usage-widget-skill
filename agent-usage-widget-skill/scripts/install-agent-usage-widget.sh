@@ -208,7 +208,14 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
     } finally {
       clearTimeout(timer);
     }
-    if (!response.ok) return { available: false, error: `http_${response.status}` };
+    if (!response.ok) {
+      // A rejected live refresh must not erase the last verified plan-scoped model.
+      // Otherwise the widget falls back to its legacy placeholder ("Sonnet") even when
+      // the cache correctly identifies the account's active model as Fable.
+      const cached = readClaudeUsageCache({ maxAgeMs: Infinity });
+      if (cached) return { ...cached, cache: "stale", error: `http_${response.status}` };
+      return { available: false, error: `http_${response.status}` };
+    }
 
     const data = await response.json();
     // Prefer data.limits: it is what the Claude settings UI renders, so the widget
@@ -396,10 +403,9 @@ function normalizeClaudeLimit(limit) {
   if (!limit || typeof limit !== "object") return { usedPercent: null, resetsAt: null };
   let usedPercent = finiteOrNull(limit.utilization ?? limit.used_percentage ?? limit.usedPercent);
   let resetsAt = parseReset(limit.resets_at ?? limit.resetsAt);
-  // A reset already in the past means the window is back to full: report 100%
-  // available (used 0%) rather than the stale pre-reset value.
+  // An expired observation says nothing about spending in the next window.
   if (isWindowExpired(resetsAt)) {
-    usedPercent = 0;
+    usedPercent = null;
     resetsAt = null;
   }
   return { usedPercent, resetsAt };
@@ -439,19 +445,41 @@ function pickClaudeWindow(data, exactKey, keyword) {
   return null;
 }
 
-// A reset already in the past means the window rolled over, so the pre-reset percentage
-// is not current usage. If the reading is younger than the window it rolled out of,
-// nothing can have been spent in the new window yet, so 100% available is a fact. If the
-// reading is older than that, usage since then is simply unobserved — the Codex desktop
-// app keeps its rate limits in memory and only the Codex CLI writes these snapshots — so
-// report unknown instead of inventing a full quota.
+// Crossing a reset does not reveal usage in the new window.
 function applyWindowExpiry(window) {
   if (!window || typeof window !== "object") return window;
   if (!isWindowExpired(window.resets_at)) return window;
-  const observedAtMs = Number.isFinite(window.observed_at) ? window.observed_at * 1000 : null;
-  const windowMs = Number.isFinite(window.window_minutes) ? window.window_minutes * 60 * 1000 : 0;
-  const readingCoversCurrentWindow = observedAtMs !== null && nowMs - observedAtMs <= windowMs;
-  return { ...window, used_percent: readingCoversCurrentWindow ? 0 : null, resets_at: null };
+  return { ...window, used_percent: null, resets_at: null };
+}
+
+// Share this rule across the widget, text reports and machine-readable consumers.
+// A newly generated report must never make an old vendor observation look current.
+function isFreshUsage(timestamp) {
+  const age = nowMs - Date.parse(timestamp || "");
+  return Number.isFinite(age) && age >= -60000 && age <= 180000;
+}
+
+function enforceFreshUsage(summary) {
+  for (const vendor of ["claude", "codex"]) {
+    const official = summary[vendor]?.official;
+    if (!official) continue;
+    for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
+      if (official[key]) official[key] = { ...official[key], ...normalizeClaudeLimit(official[key]) };
+    }
+    if (isFreshUsage(official.fetchedAt)) continue;
+    official.available = false;
+    official.error ||= "stale_usage";
+    for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
+      if (official[key]) official[key] = { ...official[key], usedPercent: null, resetsAt: null };
+    }
+  }
+  if (!isFreshUsage(summary.codex?.official?.fetchedAt)) {
+    for (const key of ["primary", "secondary"]) {
+      const window = summary.codex?.rateLimits?.[key];
+      if (window) summary.codex.rateLimits[key] = { ...window, used_percent: null, resets_at: null };
+    }
+  }
+  return summary;
 }
 
 function codexNewestObservedAtMs(rateLimits) {
@@ -522,7 +550,8 @@ async function summarizeCodex() {
   const week = emptyBucket();
   // Live quota first; the log scan below is the fallback for when there is no usable
   // Codex login (token missing or expired).
-  const official = await fetchCodexOfficialUsage({ force: FORCE_CLAUDE_REFRESH });
+  const official = await fetchCodexOfficialUsage({ force: process.argv.includes("--refresh") || process.argv.includes("--refresh-codex") });
+  if (official.available) return { hour, week, latestAt: Date.parse(official.fetchedAt) || 0, official, rateLimits: buildCodexRateLimits(null, null, official), filesScanned: 0 };
   let files = await walkJsonlFiles(CODEX_ROOT, QUOTA_ONLY ? nowMs - 12 * 60 * 60 * 1000 : CODEX_SCAN_SINCE_MS);
   if (QUOTA_ONLY && files.length === 0) files = await walkJsonlFiles(CODEX_ROOT, CODEX_SCAN_SINCE_MS);
   // Codex writes rate-limit snapshots in inconsistent shapes: the 5-hour and weekly
@@ -662,7 +691,8 @@ function formatReset(epochSeconds, compact = false) {
     : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 }
 
-function recoveryText(epochSeconds, remainingPercent, compact = false) {
+function recoveryText(epochSeconds, remainingPercent, compact = false, preferReset = false) {
+  if (preferReset) return T.recovery(Number.isFinite(epochSeconds) ? formatReset(epochSeconds, compact) : "n/a");
   if (Number.isFinite(remainingPercent) && Math.round(remainingPercent) >= 100) return T.already100;
   if (!Number.isFinite(epochSeconds)) return T.recovery("n/a");
   return T.recovery(formatReset(epochSeconds, compact));
@@ -691,24 +721,25 @@ function buildText(summary) {
     `${T.codexTitle}${codexAge}`,
     codexNoFiveHour
       ? `${T.fiveHour} ${T.noLimitOnPlan}`
-      : `${T.fiveHour} ${formatPercent(codexPrimaryRemaining)} ${recoveryText(x.rateLimits?.primary?.resets_at, codexPrimaryRemaining)}`,
+      : `${T.fiveHour} ${formatPercent(codexPrimaryRemaining)} ${recoveryText(x.rateLimits?.primary?.resets_at, codexPrimaryRemaining, false, true)}`,
     `${T.oneWeek} ${formatPercent(codexSecondaryRemaining)} ${recoveryText(x.rateLimits?.secondary?.resets_at, codexSecondaryRemaining, true)}`,
-    T.claudeTitle,
-    `${T.fiveHour} ${formatPercent(claudeFiveRemaining)} ${recoveryText(c.official?.fiveHour?.resetsAt, claudeFiveRemaining)}`,
-    `${T.oneWeek} ${formatPercent(claudeWeekRemaining)} ${recoveryText(c.official?.weekAll?.resetsAt, claudeWeekRemaining, true)}`,
-    `${scopedLabel} ${formatPercent(claudeScopedRemaining)} ${recoveryText(c.official?.weekScoped?.resetsAt, claudeScopedRemaining, true)}`,
+    T.claudeTitle + (c.official?.fetchedAt ? T.dataAge(formatAge(nowMs - Date.parse(c.official.fetchedAt))) : ""),
+    `${T.fiveHour} ${formatPercent(claudeFiveRemaining)} ${recoveryText(c.official?.fiveHour?.resetsAt, claudeFiveRemaining, false, true)}`,
+    `${T.oneWeek} ${formatPercent(claudeWeekRemaining)} ${recoveryText(c.official?.weekAll?.resetsAt, claudeWeekRemaining, false, true)}`,
+    `${scopedLabel} ${formatPercent(claudeScopedRemaining)} ${recoveryText(c.official?.weekScoped?.resetsAt, claudeScopedRemaining, false, true)}`,
   ];
   // Without this, a blocked/unauthenticated Claude fetch is indistinguishable from
   // an idle account: every row just reads "n/a" with no hint of where to look.
-  if (c.official?.available !== true && c.official?.error) {
+  if (c.official?.error) {
     lines.push(T.claudeReadFailed(c.official.error));
   }
+  if (x.official?.error) lines.push(`Codex: ${x.official.error}`);
   return lines.join("\n");
 }
 
 async function main() {
   const [claude, codex] = await Promise.all([summarizeClaude(), summarizeCodex()]);
-  const summary = {
+  const summary = enforceFreshUsage({
     generatedAt: new Date().toISOString(),
     windows: {
       hourStart: new Date(hourStartMs).toISOString(),
@@ -716,7 +747,7 @@ async function main() {
     },
     claude,
     codex,
-  };
+  });
 
   if (process.argv.includes("--text")) {
     process.stdout.write(`${buildText(summary)}\n`);
@@ -780,8 +811,10 @@ process.stdin.on("end", () => {
   try {
     const official = JSON.parse(raw).claude.official;
     if (official.available !== true) return console.log(String(official.error || "unknown"));
-    // A stale cache answers even when the live fetch threw, so it proves nothing here.
-    console.log(official.cache === "stale" ? "stale" : "available");
+    // A stale cache answers even when the live fetch failed, so it proves nothing here.
+    // Preserve the reason: HTTP 403 is specific to some Node builds and means the probe
+    // must continue to the next candidate instead of locking in the rejected runtime.
+    console.log(official.cache === "stale" ? String(official.error || "stale") : "available");
   } catch (error) {
     console.log("unreadable");
   }
@@ -789,10 +822,11 @@ process.stdin.on("end", () => {
 ' 2>/dev/null || true)"
   case "$probe" in
     available) NODE_BIN="$candidate"; break ;;
+    http_403) continue ;;
     # No local Claude session to verify against (not signed in to Claude Desktop, or
     # Keychain access declined), or only a stale cache to answer from. Claude percentages
     # are untestable either way, so any working node is equally good — stop probing.
-    missing_session|manual_refresh_required|stale) NODE_BIN="$candidate"; NODE_UNTESTED=1; break ;;
+    missing_session|manual_refresh_required|stale|live_unavailable:*) NODE_BIN="$candidate"; NODE_UNTESTED=1; break ;;
   esac
 done
 
@@ -823,6 +857,8 @@ cat > "$INSTALL_DIR/App/Info.plist" <<'PLIST'
   <string>com.agentusage.widget</string>
   <key>CFBundleName</key>
   <string>AgentUsageWidget</string>
+  <key>CFBundleExecutable</key>
+  <string>AgentUsageWidget</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSUIElement</key>
@@ -838,7 +874,7 @@ import AppKit
 
 struct UsageSummary: Decodable { let generatedAt: String; let claude: ClaudeSummary; let codex: CodexSummary }
 struct ClaudeSummary: Decodable { let official: ClaudeOfficial? }
-struct ClaudeOfficial: Decodable { let fiveHour: ClaudeLimit?; let weekAll: ClaudeLimit?; let weekScoped: ClaudeScopedLimit? }
+struct ClaudeOfficial: Decodable { let available: Bool?; let fetchedAt: String?; let cache: String?; let error: String?; let fiveHour: ClaudeLimit?; let weekAll: ClaudeLimit?; let weekScoped: ClaudeScopedLimit? }
 struct ClaudeLimit: Decodable { let usedPercent: Double?; let resetsAt: Double? }
 // The scoped weekly window names its own model, so the row label comes from the data
 // rather than being hardcoded — it reads "Fable" or "Sonnet" depending on the account.
@@ -846,7 +882,7 @@ struct ClaudeScopedLimit: Decodable { let usedPercent: Double?; let resetsAt: Do
 struct CodexSummary: Decodable { let rateLimits: RateLimits?; let official: CodexOfficial? }
 // available with a nil window means the plan genuinely has no such limit — distinct from
 // being unable to read it, which leaves available false.
-struct CodexOfficial: Decodable { let available: Bool?; let fiveHour: CodexLimit?; let week: CodexLimit? }
+struct CodexOfficial: Decodable { let fetchedAt: String?; let cache: String?; let error: String?; let available: Bool?; let fiveHour: CodexLimit?; let week: CodexLimit? }
 struct CodexLimit: Decodable { let usedPercent: Double?; let resetsAt: Double? }
 struct RateLimits: Decodable { let primary: RateLimitWindow?; let secondary: RateLimitWindow? }
 struct RateLimitWindow: Decodable { let used_percent: Double?; let resets_at: Double?; let observed_at: Double? }
@@ -881,6 +917,9 @@ struct Strings {
     let resetHeader: String
     let fiveHour: String
     let oneWeek: String
+    // A fully recovered window often has no next reset timestamp; explain that state
+    // instead of rendering it as missing data.
+    let already100: String
     // The plan has no such window at all, which is not the same as failing to read it.
     let noWindowOnPlan: String
     let updating: String
@@ -909,6 +948,7 @@ struct Strings {
         resetHeader: "重置時間",
         fiveHour: "5 小時",
         oneWeek: "1 週",
+        already100: "已是 100%",
         noWindowOnPlan: "無",
         updating: "更新中",
         updateFailed: "更新失敗",
@@ -936,6 +976,7 @@ struct Strings {
         resetHeader: "Resets",
         fiveHour: "5 hours",
         oneWeek: "1 week",
+        already100: "At 100%",
         noWindowOnPlan: "None",
         updating: "Updating",
         updateFailed: "Update failed",
@@ -968,7 +1009,7 @@ struct Strings {
 // One source of truth for the layout grid: every row is the same height and the same
 // pitch apart, and both sections derive from the same paddings, so no gap can drift.
 private enum Metrics {
-    static let width: CGFloat = 340
+    static let width: CGFloat = 364
     static let padding: CGFloat = 18
     static let topPadding: CGFloat = 14
     static let titleHeight: CGFloat = 18
@@ -987,7 +1028,8 @@ private enum Metrics {
     static let percentX: CGFloat = 146
     static let percentWidth: CGFloat = 68
     static let resetX: CGFloat = 222
-    static let resetWidth: CGFloat = 100
+    // Fits a complete fixed-width reset timestamp such as "08/31 23:00" at row size.
+    static let resetWidth: CGFloat = 124
 
     // Column captions sit under the top title row and label both sections' columns at once.
     static let colHeaderHeight: CGFloat = 13
@@ -1541,7 +1583,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             // node — it works when run from a shell but not under launchd.
             let resolvedNode = Runtime.nodePath
             var arguments = [Runtime.scriptPath, "--quota-only"]
-            if forceClaude { arguments.append("--refresh-claude") }
+            if forceClaude { arguments.append("--refresh") }
             if resolvedNode.isEmpty { arguments.insert("node", at: 0) }
             process.executableURL = URL(fileURLWithPath: resolvedNode.isEmpty ? "/usr/bin/env" : resolvedNode)
             process.arguments = arguments
@@ -1572,38 +1614,56 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         let primary = summary.codex.rateLimits?.primary
         let secondary = summary.codex.rateLimits?.secondary
         let claude = summary.claude.official
+        let codexFresh = summary.codex.official?.available == true && isFresh(summary.codex.official?.fetchedAt)
+        let claudeFresh = claude?.available == true && isFresh(claude?.fetchedAt)
+        let codexFiveRemaining = codexFresh ? remainingPercent(fromUsed: primary?.used_percent) : nil
+        let codexWeekRemaining = codexFresh ? remainingPercent(fromUsed: secondary?.used_percent) : nil
+        let claudeFiveRemaining = claudeFresh ? remainingPercent(fromUsed: claude?.fiveHour?.usedPercent) : nil
+        let claudeWeekRemaining = claudeFresh ? remainingPercent(fromUsed: claude?.weekAll?.usedPercent) : nil
+        let claudeScopedRemaining = claudeFresh ? remainingPercent(fromUsed: claude?.weekScoped?.usedPercent) : nil
         // The live endpoint distinguishes "this plan has no 5-hour window" from "unknown",
         // so name the absent window rather than showing --% as if the read had failed.
-        let codexNoFiveHour = summary.codex.official?.available == true && summary.codex.official?.fiveHour == nil
-        codexFivePercent.stringValue = codexNoFiveHour ? strings.noWindowOnPlan : formatPercent(remainingPercent(fromUsed: primary?.used_percent))
-        codexWeekPercent.stringValue = formatPercent(remainingPercent(fromUsed: secondary?.used_percent))
-        codexFiveReset.stringValue = codexNoFiveHour ? "—" : formatReset(primary?.resets_at, compact: false)
-        codexWeekReset.stringValue = formatReset(secondary?.resets_at, compact: true)
-        claudeFivePercent.stringValue = formatPercent(remainingPercent(fromUsed: claude?.fiveHour?.usedPercent))
-        claudeWeekPercent.stringValue = formatPercent(remainingPercent(fromUsed: claude?.weekAll?.usedPercent))
-        claudeScopedPercent.stringValue = formatPercent(remainingPercent(fromUsed: claude?.weekScoped?.usedPercent))
-        claudeFiveReset.stringValue = formatReset(claude?.fiveHour?.resetsAt, compact: false)
-        claudeWeekReset.stringValue = formatReset(claude?.weekAll?.resetsAt, compact: true)
-        claudeScopedReset.stringValue = formatReset(claude?.weekScoped?.resetsAt, compact: true)
+        let codexNoFiveHour = codexFresh && summary.codex.official?.available == true && summary.codex.official?.fiveHour == nil
+        codexFivePercent.stringValue = codexNoFiveHour ? strings.noWindowOnPlan : formatPercent(codexFiveRemaining)
+        codexWeekPercent.stringValue = formatPercent(codexWeekRemaining)
+        codexFiveReset.stringValue = codexNoFiveHour ? "—" : formatReset(codexFresh ? primary?.resets_at : nil, compact: false)
+        codexWeekReset.stringValue = formatRecovery(codexFresh ? secondary?.resets_at : nil, remaining: codexWeekRemaining, compact: true)
+        claudeFivePercent.stringValue = formatPercent(claudeFiveRemaining)
+        claudeWeekPercent.stringValue = formatPercent(claudeWeekRemaining)
+        claudeScopedPercent.stringValue = formatPercent(claudeScopedRemaining)
+        // Current-session reset time is always the primary fact for the 5-hour row.
+        // Do not replace it with "At 100%" when the official response supplies a time.
+        claudeFiveReset.stringValue = formatResetDateTime(claudeFresh ? claude?.fiveHour?.resetsAt : nil)
+        claudeWeekReset.stringValue = formatResetDateTime(claudeFresh ? claude?.weekAll?.resetsAt : nil)
+        claudeScopedReset.stringValue = formatResetDateTime(claudeFresh ? claude?.weekScoped?.resetsAt : nil)
         // Whichever model the plan scopes its weekly window to ("Fable", "Sonnet", ...).
         if let scopedLabel = claude?.weekScoped?.label, !scopedLabel.isEmpty {
             claudeScopedLabel.stringValue = scopedLabel
         }
         // Codex snapshots come from Codex CLI runs only, so they can be hours stale while
         // the Codex app shows a different number. Say so rather than looking live.
-        titleLabel.stringValue = strings.codexTitle + codexAgeSuffix(primary: primary, secondary: secondary)
-        setStatus(strings.lastUpdated(formatGeneratedAt(summary.generatedAt)))
+        titleLabel.stringValue = strings.codexTitle + freshnessSuffix(codexFresh)
+        claudeTitle.stringValue = strings.claudeTitle + freshnessSuffix(claudeFresh)
+        if codexFresh && claudeFresh {
+            // Show the older vendor observation, not the time a cached report was generated.
+            let observed = [summary.codex.official?.fetchedAt, claude?.fetchedAt].compactMap { $0 }.min() ?? summary.generatedAt
+            setStatus(strings.lastUpdated(formatGeneratedAt(observed)))
+        } else {
+            setStatus(strings.updateFailed)
+        }
     }
 
-    private func codexAgeSuffix(primary: RateLimitWindow?, secondary: RateLimitWindow?) -> String {
-        let stamps = [primary?.observed_at, secondary?.observed_at].compactMap { $0 }
-        guard let newest = stamps.max() else { return "" }
-        let age = Date().timeIntervalSince1970 - newest
-        if age <= 15 * 60 { return "" }
-        // Kept compact so the section title never collides with the timestamp.
-        if age < 3600 { return String(format: " · %.0fm", age / 60) }
-        if age < 48 * 3600 { return String(format: " · %.0fh", age / 3600) }
-        return String(format: " · %.0fd", age / 86400)
+    private func isFresh(_ timestamp: String?) -> Bool {
+        guard let timestamp else { return false }
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = parser.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) else { return false }
+        let age = Date().timeIntervalSince(date)
+        return age >= -60 && age <= 180
+    }
+
+    private func freshnessSuffix(_ fresh: Bool) -> String {
+        fresh ? "" : (Language.preference.resolved == .english ? " · stale" : " · 待更新")
     }
 
     private func remainingPercent(fromUsed used: Double?) -> Double? {
@@ -1626,6 +1686,22 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         // dates, 24-hour HH:mm for times (never "下午 12:..." truncated by the column).
         formatter.dateFormat = compact ? "MM/dd" : "HH:mm"
         return formatter.string(from: date)
+    }
+
+    private func formatResetDateTime(_ epochSeconds: Double?) -> String {
+        guard let epochSeconds else { return "--" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "MM/dd HH:mm"
+        return formatter.string(from: Date(timeIntervalSince1970: epochSeconds))
+    }
+
+    private func formatRecovery(_ epochSeconds: Double?, remaining: Double?, compact: Bool) -> String {
+        if let remaining, remaining.rounded() >= 100 {
+            return Strings.current.already100
+        }
+        return formatReset(epochSeconds, compact: compact)
     }
 
     private func formatGeneratedAt(_ isoString: String) -> String {
@@ -1712,6 +1788,10 @@ func runHeadless(_ command: String) -> Never {
                 ("resetHeader", strings.resetHeader, Metrics.resetWidth, caption),
                 ("fiveHour", strings.fiveHour, Metrics.labelWidth, row),
                 ("oneWeek", strings.oneWeek, Metrics.labelWidth, row),
+                ("already100", strings.already100, Metrics.resetWidth, value),
+                ("resetDateTime", "12/31 23:59", Metrics.resetWidth, value),
+                ("codexStaleTitle", strings.codexTitle + " · 待更新", Metrics.titleWidth, title),
+                ("claudeStaleTitle", strings.claudeTitle + " · stale", Metrics.titleWidth, title),
                 ("noWindowOnPlan", strings.noWindowOnPlan, Metrics.percentWidth, value),
                 ("updating", strings.updating, Metrics.statusMaxWidth, caption),
                 ("updateFailed", strings.updateFailed, Metrics.statusMaxWidth, caption),
@@ -1804,6 +1884,10 @@ cat > "$LAUNCH_AGENT" <<PLIST
   <string>$APP_LABEL</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=$HOME</string>
+    <string>PATH=/usr/bin:/bin:/usr/sbin:/sbin</string>
     <string>$INSTALL_DIR/run-widget.sh</string>
   </array>
   <key>WorkingDirectory</key>

@@ -204,7 +204,7 @@ Neither API keeps a fixed slot per window: on a Codex plan with no 5-hour limit,
 - Codex：`5 小時` 與 `1 週`。若方案本身沒有 5 小時視窗，顯示「此方案無此限制」，不要顯示為讀取失敗。
 - Claude：`5 小時`、`1 週`，以及方案綁定的單一模型週視窗。該模型名稱由 API 決定（例如 `Fable` 或 `Sonnet`），不可寫死。
 - 百分比代表**可用**額度，不是已使用額度。
-- 對話查詢應同時顯示查詢時間、資料生成時間，以及各窗口回復 100% 的時間；如果已是 100%，直接標示已是 100%。
+- 對話查詢應同時顯示查詢時間、資料生成時間，以及各窗口回復 100% 的日期與時間。Claude 的 `5 小時`、`1 週`、模型週視窗只要官方提供 `resetsAt`，右欄一律顯示 `MM/dd HH:mm`，即使百分比是 100% 也不得用「已是 100%」取代。官方沒有 active session／`resetsAt` 時才顯示無法取得，不得用「現在加五小時」或其他推算值猜測。
 - 小工具本身支援繁體中文與英文（右鍵選單切換，預設跟隨系統語言）。面板是固定像素格線，
   較長的字串會被靜默截斷成 `…` 而不是換行；改動任何面板字串後要跑 `--check-layout` 確認。
 - 小工具維持低干擾桌面層級；一般 App 視窗可以覆蓋它。只有右上角的重新整理圖示可點擊，其餘區域點擊穿透。
@@ -257,6 +257,19 @@ launchctl list | grep com.agentusage.widget
   "$HOME/.agent-usage-widget/scripts/usage-summary.js" --quota-only --refresh --text
 ```
 
+After a source update, also inspect the live executable path. An older checkout can leave an
+`AgentUsageWidget` process running; `run-widget.sh` then sees the shared process name and exits
+without starting the newly installed copy. The accepted path must start with
+`$HOME/.agent-usage-widget/`:
+
+```bash
+ps -axo pid=,command= | grep '[A]gentUsageWidget.app/Contents/MacOS/AgentUsageWidget'
+```
+
+If the only live path is another checkout, stop that specific old PID, run
+`$HOME/.agent-usage-widget/run-widget.sh` once, and inspect the process path again. Do not report
+the update as active merely because the installer printed `Installed Agent Usage Widget`.
+
 Never invoke a bare `node` from PATH. Use the interpreter the install recorded — `node-path`
 for a source install, the bundled binary for a packaged one. The Claude endpoint rejects some
 Node builds outright with HTTP 403 while accepting others with identical cookies, and the
@@ -289,3 +302,20 @@ Deleting the cloned repository does **not** uninstall anything: installing copie
 `$HOME` and, for the packaged channel, `/Applications`. The widget has no Dock icon or menu
 bar item (`LSUIElement`), so it cannot be quit from the app switcher — use its right-click
 menu, or `pkill -x AgentUsageWidget`.
+
+## Freshness and failed refreshes
+
+Never infer a full quota when a cached reset time passes. Usage in the new window is
+unknown until the service returns another observation. A report generated now does not
+make cached observations current. Percentages older than three minutes, missing a valid
+observation time, or dated more than one minute into the future must render unavailable.
+Retain the plan-scoped model label, show a stale/update-needed title, and expose a failed
+refresh even when cached data exists. Both the widget refresh button and `--live` report
+must refresh both vendors with `--refresh`. Do not silently switch authentication sources
+or rewrite credentials when a service refuses a request; record that live verification is
+blocked until the user restores sign-in.
+
+Run the offline regression suite from the repository root with
+`node --test tests/usage-freshness.test.cjs`, then compile the widget and run
+`AgentUsageWidget --check-layout`. Restart only the identified installed widget process
+and verify its executable path. Passing offline tests does not prove live quota access.
