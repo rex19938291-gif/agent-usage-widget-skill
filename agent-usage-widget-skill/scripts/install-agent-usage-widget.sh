@@ -466,14 +466,14 @@ function enforceFreshUsage(summary) {
     for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
       if (official[key]) official[key] = { ...official[key], ...normalizeClaudeLimit(official[key]) };
     }
-    if (isFreshUsage(official.fetchedAt)) continue;
+    if (official.available && !official.error && official.cache !== "stale" && isFreshUsage(official.fetchedAt)) continue;
     official.available = false;
     official.error ||= "stale_usage";
     for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
       if (official[key]) official[key] = { ...official[key], usedPercent: null, resetsAt: null };
     }
   }
-  if (!isFreshUsage(summary.codex?.official?.fetchedAt)) {
+  if (!summary.codex?.official?.available || !isFreshUsage(summary.codex?.official?.fetchedAt)) {
     for (const key of ["primary", "secondary"]) {
       const window = summary.codex?.rateLimits?.[key];
       if (window) summary.codex.rateLimits[key] = { ...window, used_percent: null, resets_at: null };

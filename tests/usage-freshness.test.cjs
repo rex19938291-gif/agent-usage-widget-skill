@@ -56,8 +56,9 @@ test('missing and future observation times cannot pass freshness checks', t => {
   }
 });
 
-test('rejected live refresh exposes the error instead of silently serving stale success', t => {
-  const f=fixture(t, 13*3600*1000);
+test('rejected live refresh invalidates even a recent full-availability cache', t => {
+  const f=fixture(t, 60000);
+  f.claude.fiveHour.usedPercent=0; f.save();
   const mocked=source.replace('main().catch(', `readClaudeDesktopSession = () => ({orgId: "test", cookieHeader: "test=dummy"});
 fetch = async () => ({ok: false, status: 403});
 main().catch(`);
