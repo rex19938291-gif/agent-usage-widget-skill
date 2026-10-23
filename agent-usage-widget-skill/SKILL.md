@@ -213,7 +213,8 @@ Both services prefer official observations and retain bounded local fallbacks.
   the old cache. Attempt ownership prevents older completions from overwriting newer results.
   Observation timestamps allow at most five seconds of future skew (also enforced in Swift).
   Cookie observations retain their three-minute cache lifetime; their refresh cannot bypass
-  the separate ten-minute limit on long-lived requests. No credential is persisted.
+  the separate ten-minute background limit on long-lived requests (explicit `--manual`
+  requests use a 60-second limit). No credential is persisted.
 - Claude final fallback: the existing Desktop cookie store and `Claude Safe Storage`,
   sent only to `https://claude.ai/api/organizations/<org_uuid>/usage`.
 
@@ -332,12 +333,17 @@ unknown until another observation arrives. A newly generated report cannot renew
 observation. Ordinary official/cache observations expire after three minutes; Claude
 long-lived observations stay usable for ten minutes to match polling. Codex recorded
 observations may be up to two days old, must name the observation time, and require an
-unexpired reset for each displayed window. Reject invalid times or times more than one
-minute in the future. Apply the same source-specific lifetime in JavaScript and Swift.
+unexpired reset for each displayed window. Reject invalid times or times more than
+five seconds in the future. Apply the same source-specific lifetime in JavaScript and Swift.
 
 A failed or pending Claude polling attempt cannot revive an older cached success,
 including a cached 100% remaining value. Preserve the model label. Both refresh controls
-and `--live` request a refresh, subject to the ten-minute cap. Never rewrite credentials,
+and `--live` request a refresh, subject to the ten-minute background cap.
+The widget button and “Refresh now” menu pass `--manual`: completed attempts may
+be retried after 60 seconds; active attempts retain the existing mutual exclusion
+and abandoned-attempt lease. Repeated clicks during a running update queue one
+manual follow-up. The status shows the local completion time; each service title
+keeps its observation time or marks stale data. Never rewrite credentials,
 change login or create a scheduler as part of quota recovery. Real authenticated access
 must be verified separately from the offline suite.
 

@@ -507,3 +507,37 @@ fetch = async url => {
   const state=JSON.parse(fs.readFileSync(path.join(f.install,'.cache/claude-oauth-poll.json')));
   assert.equal(state.longLivedStartedAt,longStart);
 });
+
+for (const [manual, elapsed, expected] of [[true,59000,2],[true,60000,4],[true,61000,4],[false,61000,2],[false,600000,4],[false,601000,4]]) {
+  test(`更新按鈕: ${manual?'manual 60-second':'automatic ten-minute'} throttle at ${elapsed/1000}s sends ${expected} requests`, t=>{
+    const f=fixture(t); oauthMock(f,429,headersAt());
+    const args=manual?['--refresh','--manual']:['--refresh'];
+    assert.equal(JSON.parse(f.run(...args)).claude.official.fiveHour.usedPercent,39);
+    const statePath=path.join(f.install,'.cache/claude-oauth-poll.json');
+    const state=JSON.parse(fs.readFileSync(statePath));
+    state.startedAt=Date.now()-elapsed;
+    state.longLivedStartedAt=state.startedAt;
+    fs.writeFileSync(statePath,JSON.stringify(state));
+    assert.equal(JSON.parse(f.run(...args)).claude.official.fiveHour.usedPercent,39);
+    assert.equal(Number(fs.readFileSync(path.join(f.home,'request-count'))),expected);
+    const next=JSON.parse(fs.readFileSync(statePath));
+    assert.equal(next.attemptId===state.attemptId,expected===2);
+  });
+}
+test('更新按鈕: manual refresh cannot replace a 61-second in-progress attempt',t=>{
+  const f=fixture(t); oauthMock(f,429,headersAt());
+  const statePath=path.join(f.install,'.cache/claude-oauth-poll.json');
+  fs.writeFileSync(statePath,JSON.stringify({attemptId:'active-attempt',state:'in_progress',startedAt:Date.now()-61000,longLivedStartedAt:Date.now()-61000}));
+  assert.equal(JSON.parse(f.run('--manual','--refresh')).claude.official.available,false);
+  assert.equal(fs.existsSync(path.join(f.home,'request-count')),false);
+  assert.equal(JSON.parse(fs.readFileSync(statePath)).attemptId,'active-attempt');
+});
+test('更新按鈕: rejected manual attempt after 61 seconds invalidates the previous successful percentage',t=>{
+  const f=fixture(t);f.claude.source='oauth_headers';f.claude.fiveHour.usedPercent=0;f.save();
+  const statePath=path.join(f.install,'.cache/claude-oauth-poll.json');
+  fs.writeFileSync(statePath,JSON.stringify({attemptId:f.claude.attemptId,state:'succeeded',startedAt:Date.now()-61000,longLivedStartedAt:Date.now()-61000}));
+  f.mock(`readClaudeLongLivedLogin=()=> 'dummy'; fetch=async()=>({status:403});`);
+  assert.equal(JSON.parse(f.run('--manual','--refresh')).claude.official.fiveHour.usedPercent,null);
+  assert.equal(JSON.parse(f.run()).claude.official.fiveHour.usedPercent,null);
+  assert.equal(JSON.parse(fs.readFileSync(statePath)).state,'failed');
+});

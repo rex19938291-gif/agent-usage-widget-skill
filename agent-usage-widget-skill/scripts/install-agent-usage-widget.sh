@@ -29,7 +29,8 @@ const CODEX_AUTH = path.join(HOME, ".codex", "auth.json");
 const CACHE_DIR = path.join(INSTALL_DIR, ".cache");
 const CLAUDE_USAGE_CACHE = path.join(CACHE_DIR, "claude-usage-percentages.json");
 const CODEX_USAGE_CACHE = path.join(CACHE_DIR, "codex-usage-percentages.json");
-const FORCE_CLAUDE_REFRESH = process.argv.includes("--refresh-claude") || process.argv.includes("--refresh");
+const MANUAL_REFRESH = process.argv.includes("--manual");
+const FORCE_CLAUDE_REFRESH = MANUAL_REFRESH || process.argv.includes("--refresh-claude") || process.argv.includes("--refresh");
 const QUOTA_ONLY = process.argv.includes("--quota-only");
 
 // Affects --text rendering only. The JSON output stays language-neutral (raw percentages
@@ -349,11 +350,16 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
     const currentCache = readClaudeUsageCache({ maxAgeMs: Infinity });
     // Cookie-only observations retain their existing three-minute lifetime. They
     // may be refreshed sooner, while the long-lived requests keep their own cap.
-    const interval = state?.state === "succeeded" && currentCache?.attemptId === state.attemptId &&
+    const longLivedInterval = MANUAL_REFRESH ? 60000 : CLAUDE_POLL_MS;
+    // A manual click must not replace an active attempt. Only abandoned attempts
+    // older than the existing ten-minute lease can be reclaimed.
+    const cookieInterval = state?.state === "succeeded" && currentCache?.attemptId === state.attemptId &&
       currentCache.source === "desktop_cookie" ? 180000 : CLAUDE_POLL_MS;
+    const interval = state?.state === "in_progress" ? CLAUDE_POLL_MS :
+      (MANUAL_REFRESH ? 60000 : cookieInterval);
     // A future start is also throttled: clock rollback cannot bypass the cap.
     if (state && Date.now() - state.startedAt < interval) return { throttled: true, state };
-    const skipLongLived = Number.isFinite(state?.longLivedStartedAt) && Date.now() - state.longLivedStartedAt < CLAUDE_POLL_MS;
+    const skipLongLived = Number.isFinite(state?.longLivedStartedAt) && Date.now() - state.longLivedStartedAt < longLivedInterval;
     const attempt = { attemptId: `${process.pid}-${crypto.randomUUID()}`, state: "in_progress", startedAt: Date.now(),
       previousSuccessId: state?.state === "succeeded" ? state.attemptId : null,
       longLivedStartedAt: skipLongLived ? state.longLivedStartedAt : Date.now() };
@@ -1080,6 +1086,9 @@ struct Strings {
     let updating: String
     let updateFailed: String
     let lastUpdated: (String) -> String
+    let dataTime: (String) -> String
+    let recordedTime: (String) -> String
+    let staleData: String
     let refreshTooltip: String
     let refreshNow: String
     let listSeparator: String
@@ -1105,9 +1114,12 @@ struct Strings {
         oneWeek: "1 週",
         already100: "已是 100%",
         noWindowOnPlan: "無",
-        updating: "更新中",
+        updating: "更新中…",
         updateFailed: "更新失敗",
-        lastUpdated: { "上次 \($0)" },
+        lastUpdated: { "更新 \($0)" },
+        dataTime: { " · 資料 \($0)" },
+        recordedTime: { "Codex · 最後紀錄 \($0)" },
+        staleData: " · 資料過時",
         refreshTooltip: "重新抓取數據",
         refreshNow: "立即刷新",
         listSeparator: "、",
@@ -1133,9 +1145,12 @@ struct Strings {
         oneWeek: "1 week",
         already100: "At 100%",
         noWindowOnPlan: "None",
-        updating: "Updating",
+        updating: "Updating…",
         updateFailed: "Update failed",
-        lastUpdated: { "Last \($0)" },
+        lastUpdated: { "Updated \($0)" },
+        dataTime: { " · data \($0)" },
+        recordedTime: { "Codex · recorded \($0)" },
+        staleData: " · stale",
         refreshTooltip: "Fetch the latest numbers",
         refreshNow: "Refresh now",
         listSeparator: ", ",
@@ -1176,6 +1191,7 @@ private enum Metrics {
     // Section titles are the longest strings that vary by language ("Codex quota left" plus
     // a data-age suffix), so they get their own width instead of a literal at each use site.
     static let titleWidth: CGFloat = 160
+    static let claudeTitleWidth: CGFloat = width - 2 * padding
     // Clamp for the status text, which is measured rather than fixed; past this it would
     // collide with the section title on its left.
     static let statusMaxWidth: CGFloat = 140
@@ -1425,6 +1441,8 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
     private var timer: Timer?
     private var isRefreshing = false
+    private var pendingManualRefresh = false
+    private var lastCompletedAt: Date?
     // Kept so a language change can re-render the numbers already on screen instead of
     // waiting for the next 60-second refresh.
     private var lastSummary: UsageSummary?
@@ -1530,7 +1548,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.045).cgColor
         visual.addSubview(divider)
 
-        claudeTitle.frame = NSRect(x: Metrics.padding, y: Metrics.claudeTitleY, width: Metrics.titleWidth, height: Metrics.titleHeight)
+        claudeTitle.frame = NSRect(x: Metrics.padding, y: Metrics.claudeTitleY, width: Metrics.claudeTitleWidth, height: Metrics.titleHeight)
         visual.addSubview(claudeTitle)
         addRow(to: visual, y: Metrics.rowY(2), label: claudeFiveLabel, percent: claudeFivePercent, reset: claudeFiveReset)
         addRow(to: visual, y: Metrics.rowY(3), label: claudeWeekLabel, percent: claudeWeekPercent, reset: claudeWeekReset)
@@ -1566,6 +1584,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         // switching language must not look like the numbers went stale.
         if let lastSummary {
             updateUI(lastSummary)
+            if isRefreshing { setStatus(strings.updating) }
         } else {
             titleLabel.stringValue = strings.codexTitle
             setStatus(strings.updating)
@@ -1591,7 +1610,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshTapped() {
-        refresh(forceClaude: true)
+        refresh(forceClaude: true, manual: true)
     }
 
     // MARK: - Context menu
@@ -1727,10 +1746,16 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func refresh(forceClaude: Bool = false) {
-        if isRefreshing { return }
+    private func refresh(forceClaude: Bool = false, manual: Bool = false) {
+        if isRefreshing {
+            if manual { pendingManualRefresh = true }
+            setStatus(Strings.current.updating)
+            refreshButton.alphaValue = 0.4
+            return
+        }
         isRefreshing = true
         setStatus(Strings.current.updating)
+        refreshButton.alphaValue = 0.4
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let process = Process()
@@ -1739,6 +1764,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             let resolvedNode = Runtime.nodePath
             var arguments = [Runtime.scriptPath, "--quota-only"]
             if forceClaude { arguments.append("--refresh") }
+            if manual { arguments.append("--manual") }
             if resolvedNode.isEmpty { arguments.insert("node", at: 0) }
             process.executableURL = URL(fileURLWithPath: resolvedNode.isEmpty ? "/usr/bin/env" : resolvedNode)
             process.arguments = arguments
@@ -1750,16 +1776,29 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
                 process.waitUntilExit()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 DispatchQueue.main.async {
-                    self.isRefreshing = false
                     if process.terminationStatus == 0, let summary = try? JSONDecoder().decode(UsageSummary.self, from: data) {
+                        self.lastCompletedAt = Date()
                         self.updateUI(summary)
                     } else {
                         self.setStatus(Strings.current.updateFailed)
                     }
+                    self.finishRefresh()
                 }
             } catch {
-                DispatchQueue.main.async { self.isRefreshing = false; self.setStatus(Strings.current.updateFailed) }
+                DispatchQueue.main.async {
+                    self.setStatus(Strings.current.updateFailed)
+                    self.finishRefresh()
+                }
             }
+        }
+    }
+
+    private func finishRefresh() {
+        isRefreshing = false
+        refreshButton.alphaValue = 1
+        if pendingManualRefresh {
+            pendingManualRefresh = false
+            refresh(forceClaude: true, manual: true)
         }
     }
 
@@ -1798,15 +1837,17 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         // Codex snapshots come from Codex CLI runs only, so they can be hours stale while
         // the Codex app shows a different number. Say so rather than looking live.
         let recorded = summary.codex.official?.source == "session_record" && codexFresh
-        let recordTitle = Language.preference.resolved == .english ? "Codex · recorded " : "Codex · 最後紀錄 "
         titleLabel.stringValue = recorded
-            ? recordTitle + formatGeneratedAt(summary.codex.official?.fetchedAt ?? "")
+            ? strings.recordedTime(formatGeneratedAt(summary.codex.official?.fetchedAt ?? ""))
             : strings.codexTitle + freshnessSuffix(codexFresh)
-        claudeTitle.stringValue = strings.claudeTitle + freshnessSuffix(claudeFresh)
-        if codexFresh && claudeFresh {
-            // Show the older vendor observation, not the time a cached report was generated.
-            let observed = [summary.codex.official?.fetchedAt, claude?.fetchedAt].compactMap { $0 }.min() ?? summary.generatedAt
-            setStatus(strings.lastUpdated(formatGeneratedAt(observed)))
+        claudeTitle.stringValue = strings.claudeTitle + (claudeFresh
+            ? strings.dataTime(formatGeneratedAt(claude?.fetchedAt ?? "")) : strings.staleData)
+        if isRefreshing && pendingManualRefresh {
+            setStatus(strings.updating)
+        } else if codexFresh && claudeFresh, let completedAt = lastCompletedAt {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm"
+            setStatus(strings.lastUpdated(formatter.string(from: completedAt)))
         } else {
             setStatus(strings.updateFailed)
         }
@@ -1823,7 +1864,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     }
 
     private func freshnessSuffix(_ fresh: Bool) -> String {
-        fresh ? "" : (Language.preference.resolved == .english ? " · stale" : " · 待更新")
+        fresh ? "" : Strings.current.staleData
     }
 
     private func remainingPercent(fromUsed used: Double?) -> Double? {
@@ -1943,16 +1984,16 @@ func runHeadless(_ command: String) -> Never {
             let checks: [(String, String, CGFloat, NSFont)] = [
                 // Worst case for the titles is the Codex one with a stale-data suffix.
                 ("codexTitle", strings.codexTitle + " · 12h", Metrics.titleWidth, title),
-                ("claudeTitle", strings.claudeTitle, Metrics.titleWidth, title),
-                ("codexRecordTitle", (language == .english ? "Codex · recorded " : "Codex · 最後紀錄 ") + "23:59", Metrics.titleWidth, title),
+                ("claudeTitle", strings.claudeTitle + strings.dataTime("23:59"), Metrics.claudeTitleWidth, title),
+                ("codexRecordTitle", strings.recordedTime("23:59"), Metrics.titleWidth, title),
                 ("remainingHeader", strings.remainingHeader, Metrics.percentWidth, caption),
                 ("resetHeader", strings.resetHeader, Metrics.resetWidth, caption),
                 ("fiveHour", strings.fiveHour, Metrics.labelWidth, row),
                 ("oneWeek", strings.oneWeek, Metrics.labelWidth, row),
                 ("already100", strings.already100, Metrics.resetWidth, value),
                 ("resetDateTime", "12/31 23:59", Metrics.resetWidth, value),
-                ("codexStaleTitle", strings.codexTitle + " · 待更新", Metrics.titleWidth, title),
-                ("claudeStaleTitle", strings.claudeTitle + " · stale", Metrics.titleWidth, title),
+                ("codexStaleTitle", strings.codexTitle + strings.staleData, Metrics.titleWidth, title),
+                ("claudeStaleTitle", strings.claudeTitle + strings.staleData, Metrics.claudeTitleWidth, title),
                 ("noWindowOnPlan", strings.noWindowOnPlan, Metrics.percentWidth, value),
                 ("updating", strings.updating, Metrics.statusMaxWidth, caption),
                 ("updateFailed", strings.updateFailed, Metrics.statusMaxWidth, caption),
