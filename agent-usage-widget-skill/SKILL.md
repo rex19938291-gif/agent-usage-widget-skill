@@ -7,7 +7,7 @@ description: Install, maintain, and query a local macOS desktop widget that show
 
 Use this skill to query, install, or update a local-only macOS desktop widget that shows Claude and Codex quota availability.
 
-繁體中文重點：這個 skill 會替使用者安裝一個 macOS 桌面小工具，用百分比呈現 Claude 與 Codex 的可用額度與回復 100% 時間。它只讀取本機資料；Claude 官方百分比會使用使用者既有的 Claude Desktop 登入 session，在記憶體中查詢官方 usage API。不得輸出、保存、提交 cookie、token、org ID 或 Keychain secret，也不得傳送給 Claude 官方 API 以外的第三方。
+繁體中文重點：這個 skill 會替使用者安裝一個 macOS 桌面小工具，用百分比呈現 Claude 與 Codex 的可用額度與回復 100% 時間。它只讀取本機資料；Claude 官方百分比優先使用本機既有的長效登入，在記憶體中查詢官方額度或極小請求的回應標頭；桌面版登入僅作備援。不得輸出、保存、提交 cookie、token、org ID 或 Keychain secret，也不得傳送給 Claude 官方 API 以外的第三方。
 
 ## Agent Compatibility
 
@@ -44,7 +44,7 @@ Important: the default slash query should not force a Claude live refresh. It sh
 If the command says the widget data source is unavailable, explain briefly:
 
 - The query only works in a Codex environment that can read the same Mac user's `$HOME`.
-- Claude live percentages also require Claude Desktop to be logged in and Keychain access to `Claude Safe Storage`.
+- Claude live percentages require an existing long-lived Claude Code login available through `launchctl getenv CLAUDE_CODE_OAUTH_TOKEN`, or the Desktop cookie fallback and access to `Claude Safe Storage`.
 - On a phone, the chat UI can trigger the skill, but the actual read still happens wherever Codex is executing. If that is not this Mac, it cannot see this Mac's local session.
 
 For an explicit live refresh, only when the user asks for it, run:
@@ -182,18 +182,40 @@ LaunchAgent label but points it at `/Applications`.
 
 ## Data Sources
 
-Both services are read live from the same endpoints their own apps use, with a local
-fallback when there is no usable login.
+Both services prefer official observations and retain bounded local fallbacks.
 
-- Codex: `https://chatgpt.com/backend-api/codex/usage`, authorized with the OAuth
-  `access_token` and `account_id` from `$HOME/.codex/auth.json`.
-- Codex fallback: rate-limit records in `$HOME/.codex/sessions/**/*.jsonl`. These are
-  written **only while the Codex CLI runs** — the desktop app keeps its limits in memory —
-  so they can be many hours stale. Report their age; never present them as live.
-- Claude: `https://claude.ai/api/organizations/<org_uuid>/usage`, authorized with the
-  Claude Desktop cookie store plus the macOS Keychain entry `Claude Safe Storage`.
-- Claude fallback: the widget's last cached percentages. If Claude Desktop is absent, not
-  logged in, or Keychain access is denied, report Claude as unavailable without crashing.
+- Codex: `https://chatgpt.com/backend-api/codex/usage`, using the existing local login.
+- Codex fallback: enumerate `rollout-*.jsonl` metadata throughout the session tree,
+  retaining the five newest files modified within two days, including resumed conversations
+  created on older dates. Above 5000 files, restrict metadata lookup to the last 30 calendar
+  days of creation directories. Read backward to the last valid
+  `token_count.rate_limits` event per file, and compare event observation times with any
+  usable official observation. Label recorded observations with their time. Never scan
+  the full session history contents for a quota report or mix windows across different events.
+- Claude: read the existing long-lived login via `launchctl getenv CLAUDE_CODE_OAUTH_TOKEN`
+  in memory only. Try `https://api.anthropic.com/api/oauth/usage`; if unavailable, send one
+  minimal `claude-haiku-4-5` request (`max_tokens: 1`) to the official `/v1/messages`
+  service. Read unified usage/reset headers even on non-200 responses. This minimal
+  request consumes a small amount of quota and requires the user's authorization.
+- The entire Claude long-lived polling cycle is capped at once per ten minutes, including
+  failures. Before any network cycle, persist a unique attempt ID and in-progress state;
+  commit the matching ID to the percentage cache before marking the state succeeded. Persist
+  only IDs, state and attempt times in the existing cache directory; cache
+  percentages/timestamps and retain the scoped model label with unknown numbers when
+  that source lacks model-specific usage. No credential refresh or Keychain writes.
+- Each Claude window needs a valid future reset before its percentage can be used,
+  including cached header observations. Adopt a percentage only when its ID matches a
+  succeeded state. Missing, broken, failed or in-progress state means unknown; even the
+  previous success stays unknown throughout a new attempt, to survive failed terminal writes.
+  Cache-only reads confirm replacement of the actual state file under the same short lock;
+  unrelated writable files cannot prove this works. Claim write failure prevents all network
+  requests and invalidates in place where possible, then falls back to clearing/removing
+  the old cache. Attempt ownership prevents older completions from overwriting newer results.
+  Observation timestamps allow at most five seconds of future skew (also enforced in Swift).
+  Cookie observations retain their three-minute cache lifetime; their refresh cannot bypass
+  the separate ten-minute limit on long-lived requests. No credential is persisted.
+- Claude final fallback: the existing Desktop cookie store and `Claude Safe Storage`,
+  sent only to `https://claude.ai/api/organizations/<org_uuid>/usage`.
 
 Windows are identified by their **duration**, never by their position in the response.
 Neither API keeps a fixed slot per window: on a Codex plan with no 5-hour limit,
@@ -214,8 +236,8 @@ Neither API keeps a fixed slot per window: on a Codex plan with no 5-hour limit,
 
 - Do not print, log, cache, or save Claude cookies, organization IDs, Keychain secrets, or
   the Codex OAuth tokens in `$HOME/.codex/auth.json`.
-- Send that login material only to the service's own official usage endpoint, never to any
-  third party.
+- Send that login material only to the documented official usage service or authorized
+  minimal messages request, never to any third party. Disable redirects on bearer requests.
 - Cache only non-sensitive usage percentages and timestamps.
 - Use `$HOME` and runtime discovery. Do not hard-code a developer's username, absolute home path, LaunchAgent label, org ID, PID, or local project path.
 - Keep the public skill free of `allowed-tools` preapprovals or dynamic shell injection unless a maintainer deliberately reviews and accepts that broader trust model.
@@ -306,14 +328,18 @@ menu, or `pkill -x AgentUsageWidget`.
 ## Freshness and failed refreshes
 
 Never infer a full quota when a cached reset time passes. Usage in the new window is
-unknown until the service returns another observation. A report generated now does not
-make cached observations current. Percentages older than three minutes, missing a valid
-observation time, or dated more than one minute into the future must render unavailable.
-Retain the plan-scoped model label, show a stale/update-needed title, and expose a failed
-refresh even when cached data exists. Both the widget refresh button and `--live` report
-must refresh both vendors with `--refresh`. Do not silently switch authentication sources
-or rewrite credentials when a service refuses a request; record that live verification is
-blocked until the user restores sign-in.
+unknown until another observation arrives. A newly generated report cannot renew an
+observation. Ordinary official/cache observations expire after three minutes; Claude
+long-lived observations stay usable for ten minutes to match polling. Codex recorded
+observations may be up to two days old, must name the observation time, and require an
+unexpired reset for each displayed window. Reject invalid times or times more than one
+minute in the future. Apply the same source-specific lifetime in JavaScript and Swift.
+
+A failed or pending Claude polling attempt cannot revive an older cached success,
+including a cached 100% remaining value. Preserve the model label. Both refresh controls
+and `--live` request a refresh, subject to the ten-minute cap. Never rewrite credentials,
+change login or create a scheduler as part of quota recovery. Real authenticated access
+must be verified separately from the offline suite.
 
 Run the offline regression suite from the repository root with
 `node --test tests/usage-freshness.test.cjs`, then compile the widget and run

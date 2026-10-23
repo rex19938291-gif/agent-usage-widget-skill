@@ -180,71 +180,211 @@ async function summarizeClaude() {
   return { hour, week, official, filesScanned: files.length, dedupedEvents: seen.size };
 }
 
-async function fetchClaudeOfficialUsage({ force = false } = {}) {
-  if (!force) {
-    const cached = readClaudeUsageCache({ maxAgeMs: Infinity });
-    if (cached) return { ...cached, cache: "cached" };
-    return { available: false, error: "manual_refresh_required" };
-  }
+const CLAUDE_POLL_MS = 10 * 60 * 1000;
+const CLAUDE_POLL_STATE = path.join(CACHE_DIR, "claude-oauth-poll.json");
+let claudeCacheRejected = false;
 
+function readClaudeLongLivedLogin() {
   try {
-    const session = readClaudeDesktopSession();
-    if (!session.orgId || !session.cookieHeader) return { available: false, error: "missing_session" };
+    return execFileSync("/bin/launchctl", ["getenv", "CLAUDE_CODE_OAUTH_TOKEN"],
+      { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch { return ""; }
+}
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    let response;
-    try {
-      response = await fetch(`https://claude.ai/api/organizations/${encodeURIComponent(session.orgId)}/usage`, {
-        signal: controller.signal,
-        headers: {
-          accept: "application/json, text/plain, */*",
-          cookie: session.cookieHeader,
-          referer: "https://claude.ai/settings/usage",
-          origin: "https://claude.ai",
-          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AgentUsageWidget",
-        },
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-    if (!response.ok) {
-      // A rejected live refresh must not erase the last verified plan-scoped model.
-      // Otherwise the widget falls back to its legacy placeholder ("Sonnet") even when
-      // the cache correctly identifies the account's active model as Fable.
-      const cached = readClaudeUsageCache({ maxAgeMs: Infinity });
-      if (cached) return { ...cached, cache: "stale", error: `http_${response.status}` };
-      return { available: false, error: `http_${response.status}` };
-    }
+function scopedUnknown(cached) {
+  return { usedPercent: null, resetsAt: null, label: cached?.weekScoped?.label || "Sonnet" };
+}
 
-    const data = await response.json();
-    // Prefer data.limits: it is what the Claude settings UI renders, so the widget
-    // cannot disagree with the app. The flat seven_day_* fields are legacy and the
-    // per-model one is dead weight — on a Max plan whose scoped weekly window is
-    // Fable, seven_day_sonnet is null while limits carries the real Fable entry.
-    const fromLimits = normalizeClaudeLimitsArray(data.limits);
-    const official = {
-      available: true,
-      fetchedAt: new Date().toISOString(),
-      fiveHour: fromLimits?.fiveHour ?? normalizeClaudeLimit(data.five_hour),
-      weekAll: fromLimits?.weekAll ?? normalizeClaudeLimit(data.seven_day),
-      weekScoped: fromLimits?.weekScoped ?? {
-        ...normalizeClaudeLimit(pickClaudeWindow(data, "seven_day_sonnet", "sonnet")),
-        label: "Sonnet",
-      },
-    };
-    writeClaudeUsageCache(official);
-    return { ...official, cache: "live" };
-  } catch (error) {
-    // Surface WHY the live fetch failed. A bare catch here made every failure —
-    // wrong node build, no network, keychain denied — look identical to "no data",
-    // which is unusably hard to debug. Only the error message is kept, never the
-    // request, cookies, or org id.
-    const reason = String(error?.message || error).slice(0, 120);
-    const cached = readClaudeUsageCache({ maxAgeMs: Infinity });
-    if (cached) return { ...cached, cache: "stale", error: `live_unavailable:${reason}` };
-    return { available: false, error: `unavailable:${reason}` };
+function normalizeClaudeOfficial(data, cached, source) {
+  const limits = normalizeClaudeLimitsArray(data?.limits);
+  let scoped = limits?.weekScoped;
+  if (!scoped?.label) {
+    const key = Object.keys(data || {}).find(key => key.startsWith("seven_day_") && data[key] && typeof data[key] === "object");
+    scoped = key ? { ...normalizeClaudeLimit(data[key]), label: key.slice(10).replace(/^./, c => c.toUpperCase()) } : scopedUnknown(cached);
   }
+  const fiveHour = limits?.fiveHour ?? normalizeClaudeLimit(data?.five_hour);
+  const weekAll = limits?.weekAll ?? normalizeClaudeLimit(data?.seven_day);
+  return { available: Number.isFinite(fiveHour.usedPercent) || Number.isFinite(weekAll.usedPercent),
+    fetchedAt: new Date().toISOString(), source, fiveHour, weekAll, weekScoped: scoped };
+}
+
+function parseClaudeUsageHeaders(headers, cached) {
+  const window = name => {
+    const utilization = headers.get(`anthropic-ratelimit-unified-${name}-utilization`);
+    const reset = headers.get(`anthropic-ratelimit-unified-${name}-reset`);
+    const fraction = utilization === null || utilization.trim() === "" ? NaN : Number(utilization);
+    const seconds = reset === null || reset.trim() === "" ? NaN : Number(reset);
+    const valid = Number.isFinite(fraction) && fraction >= 0 && fraction <= 1 &&
+      Number.isFinite(seconds) && seconds * 1000 > nowMs;
+    return { usedPercent: valid ? Math.round(fraction * 100) : null,
+      resetsAt: valid ? seconds : null };
+  };
+  const fiveHour = window("5h"), weekAll = window("7d");
+  return { available: Number.isFinite(fiveHour.usedPercent) || Number.isFinite(weekAll.usedPercent),
+    fetchedAt: new Date().toISOString(), source: "oauth_headers", fiveHour, weekAll, weekScoped: scopedUnknown(cached) };
+}
+
+function readClaudePollState() {
+  try {
+    const state = JSON.parse(fs.readFileSync(CLAUDE_POLL_STATE, "utf8"));
+    return typeof state?.attemptId === "string" && state.attemptId.length > 0 &&
+      ["in_progress", "succeeded", "failed"].includes(state.state) && Number.isFinite(state.startedAt) ? state : null;
+  } catch { return null; }
+}
+function writeClaudePollState(state) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${CLAUDE_POLL_STATE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+  fs.renameSync(tmp, CLAUDE_POLL_STATE);
+}
+
+function withClaudePollLock(action) {
+  const lock = `${CLAUDE_POLL_STATE}.lock`;
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+    try { fs.mkdirSync(lock); } catch {
+      if (Date.now() - fs.statSync(lock).mtimeMs < CLAUDE_POLL_MS) return { busy: true };
+      fs.rmdirSync(lock); fs.mkdirSync(lock);
+    }
+  } catch { return { busy: true }; }
+  try { return action(); } finally { try { fs.rmdirSync(lock); } catch {} }
+}
+
+function matchingClaudeCache(state, cached) {
+  // Conservatively show unknown throughout in_progress, even when a previous success
+  // exists. A crash or failed terminal-state write must not revive that older value.
+  return !claudeCacheRejected && state?.state === "succeeded" &&
+    cached?.attemptId === state.attemptId && isUsableObservation(cached);
+}
+
+function readVerifiedClaudeCache() {
+  const result = withClaudePollLock(() => {
+    const state = readClaudePollState();
+    const cached = readClaudeUsageCache({ maxAgeMs: Infinity });
+    if (!matchingClaudeCache(state, cached)) return null;
+    // Check replacement of the ACTUAL state file, not an unrelated small probe file.
+    // Preserve the observation/attempt times. If this exact write path is broken,
+    // a different process must also reject the old percentage.
+    try { writeClaudePollState(state); return cached; } catch { return null; }
+  });
+  return result?.busy ? null : result;
+}
+
+async function fetchClaudeLongLivedUsage(cached) {
+  const credential = readClaudeLongLivedLogin();
+  if (!credential) return null;
+  const headers = { authorization: `Bearer ${credential}`, "anthropic-beta": "oauth-2025-04-20" };
+  let official;
+  try {
+    const usage = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers, redirect: "error", signal: AbortSignal.timeout(8000),
+    });
+    if (usage.status === 200) official = normalizeClaudeOfficial(await usage.json(), cached, "oauth_usage");
+    else await usage.body?.cancel();
+  } catch { /* The independent messages request must still run. */ }
+  if (!official?.available) {
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(8000),
+        headers: { ...headers, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-haiku-4-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
+      });
+      official = parseClaudeUsageHeaders(response.headers, cached);
+      await response.body?.cancel().catch(() => {});
+    } catch { /* Never expose request context or login material. */ }
+  }
+  return official?.available ? official : null;
+}
+
+async function fetchClaudeCookieUsage(cached) {
+  const session = readClaudeDesktopSession();
+  if (!session.orgId || !session.cookieHeader) return { available: false, error: "missing_session" };
+  const response = await fetch(`https://claude.ai/api/organizations/${encodeURIComponent(session.orgId)}/usage`, {
+    signal: AbortSignal.timeout(8000), redirect: "error",
+    headers: { accept: "application/json, text/plain, */*", cookie: session.cookieHeader,
+      referer: "https://claude.ai/settings/usage", origin: "https://claude.ai",
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AgentUsageWidget" },
+  });
+  if (!response.ok) return { available: false, error: `http_${response.status}` };
+  return normalizeClaudeOfficial(await response.json(), cached, "desktop_cookie");
+}
+
+function finishClaudeAttempt(attempt, official) {
+  return withClaudePollLock(() => {
+    const current = readClaudePollState();
+    // Ownership, not wall-clock ordering, decides whether this result may commit.
+    if (current?.attemptId !== attempt.attemptId || current.state !== "in_progress") {
+      const cached = readClaudeUsageCache({ maxAgeMs: Infinity });
+      return matchingClaudeCache(current, cached) ? { ...cached, cache: "cached" } : null;
+    }
+    try {
+      if (official?.available) {
+        const observed = { ...official, attemptId: attempt.attemptId };
+        writeClaudeUsageCache(observed); // Must throw on replacement failure.
+        writeClaudePollState({ ...attempt, state: "succeeded" });
+        claudeCacheRejected = false;
+        return { ...observed, cache: "live" };
+      }
+      writeClaudePollState({ ...attempt, state: "failed", error: official?.error || "live_unavailable" });
+    } catch {
+      // in_progress + any old/mismatched cache is always unknown, even if this fails.
+      try { writeClaudePollState({ ...attempt, state: "failed", error: "cache_write_failed" }); } catch {}
+    }
+    claudeCacheRejected = true;
+    return null;
+  });
+}
+
+async function fetchClaudeOfficialUsage({ force = false } = {}) {
+  const cached = readClaudeUsageCache({ maxAgeMs: Infinity });
+  const unknown = error => ({ ...cached, available: false, cache: "stale", error,
+    fiveHour: { usedPercent: null, resetsAt: null }, weekAll: { usedPercent: null, resetsAt: null },
+    weekScoped: scopedUnknown(cached) });
+  if (!force) {
+    const verified = readVerifiedClaudeCache();
+    return verified ? { ...verified, cache: "cached" } : unknown("stale_usage");
+  }
+  const claim = withClaudePollLock(() => {
+    const state = readClaudePollState();
+    const currentCache = readClaudeUsageCache({ maxAgeMs: Infinity });
+    // Cookie-only observations retain their existing three-minute lifetime. They
+    // may be refreshed sooner, while the long-lived requests keep their own cap.
+    const interval = state?.state === "succeeded" && currentCache?.attemptId === state.attemptId &&
+      currentCache.source === "desktop_cookie" ? 180000 : CLAUDE_POLL_MS;
+    // A future start is also throttled: clock rollback cannot bypass the cap.
+    if (state && Date.now() - state.startedAt < interval) return { throttled: true, state };
+    const skipLongLived = Number.isFinite(state?.longLivedStartedAt) && Date.now() - state.longLivedStartedAt < CLAUDE_POLL_MS;
+    const attempt = { attemptId: `${process.pid}-${crypto.randomUUID()}`, state: "in_progress", startedAt: Date.now(),
+      previousSuccessId: state?.state === "succeeded" ? state.attemptId : null,
+      longLivedStartedAt: skipLongLived ? state.longLivedStartedAt : Date.now() };
+    try { writeClaudePollState(attempt); } catch {
+      claudeCacheRejected = true;
+      // A failed atomic replacement can still permit in-place invalidation. Under
+      // this lock it is safe; interrupted/invalid content also fails closed on read.
+      try { fs.writeFileSync(CLAUDE_POLL_STATE, JSON.stringify({ ...attempt, state: "failed" }), { mode: 0o600 }); } catch {
+        try { fs.truncateSync(CLAUDE_USAGE_CACHE, 0); } catch {
+          try { fs.unlinkSync(CLAUDE_USAGE_CACHE); } catch {}
+        }
+      }
+      return { failed: true };
+    }
+    return { attempt, skipLongLived };
+  });
+  if (claim.busy) return unknown("refresh_pending");
+  if (claim.failed) return unknown("cache_write_failed");
+  if (claim.throttled) {
+    const verified = readVerifiedClaudeCache();
+    return verified ? { ...verified, cache: "throttled" } : unknown(claim.state.state === "in_progress" ? "refresh_pending" : claim.state.error || "refresh_failed");
+  }
+  let official;
+  if (!claim.skipLongLived) {
+    try { official = await fetchClaudeLongLivedUsage(cached); } catch {}
+  }
+  if (!official?.available) {
+    try { official = await fetchClaudeCookieUsage(cached); } catch {}
+  }
+  const finished = finishClaudeAttempt(claim.attempt, official);
+  return finished && !finished.busy ? finished : unknown(official?.error || "live_unavailable");
 }
 
 // Live Codex quota. The local session logs only get written while the Codex CLI runs — the
@@ -335,6 +475,7 @@ function readCodexUsageCache() {
     return {
       available: true,
       fetchedAt: typeof cached.fetchedAt === "string" ? cached.fetchedAt : null,
+      source: cached.source,
       fiveHour: cached.fiveHour || null,
       week: cached.week || null,
     };
@@ -403,8 +544,8 @@ function normalizeClaudeLimit(limit) {
   if (!limit || typeof limit !== "object") return { usedPercent: null, resetsAt: null };
   let usedPercent = finiteOrNull(limit.utilization ?? limit.used_percentage ?? limit.usedPercent);
   let resetsAt = parseReset(limit.resets_at ?? limit.resetsAt);
-  // An expired observation says nothing about spending in the next window.
-  if (isWindowExpired(resetsAt)) {
+  // Without a valid future reset, even a cached zero cannot describe this window.
+  if (!Number.isFinite(resetsAt) || isWindowExpired(resetsAt)) {
     usedPercent = null;
     resetsAt = null;
   }
@@ -454,9 +595,11 @@ function applyWindowExpiry(window) {
 
 // Share this rule across the widget, text reports and machine-readable consumers.
 // A newly generated report must never make an old vendor observation look current.
-function isFreshUsage(timestamp) {
-  const age = nowMs - Date.parse(timestamp || "");
-  return Number.isFinite(age) && age >= -60000 && age <= 180000;
+function isUsableObservation(official) {
+  const age = nowMs - Date.parse(official?.fetchedAt || "");
+  if (!Number.isFinite(age) || age < -5000) return false;
+  if (official.source === "session_record") return age <= 2 * 86400000;
+  return age <= (official.source?.startsWith("oauth_") ? CLAUDE_POLL_MS : 180000);
 }
 
 function enforceFreshUsage(summary) {
@@ -466,27 +609,20 @@ function enforceFreshUsage(summary) {
     for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
       if (official[key]) official[key] = { ...official[key], ...normalizeClaudeLimit(official[key]) };
     }
-    if (official.available && !official.error && official.cache !== "stale" && isFreshUsage(official.fetchedAt)) continue;
+    if (official.available && !official.error && official.cache !== "stale" && isUsableObservation(official)) continue;
     official.available = false;
     official.error ||= "stale_usage";
     for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
       if (official[key]) official[key] = { ...official[key], usedPercent: null, resetsAt: null };
     }
   }
-  if (!summary.codex?.official?.available || !isFreshUsage(summary.codex?.official?.fetchedAt)) {
+  if (!summary.codex?.official?.available || !isUsableObservation(summary.codex?.official)) {
     for (const key of ["primary", "secondary"]) {
       const window = summary.codex?.rateLimits?.[key];
       if (window) summary.codex.rateLimits[key] = { ...window, used_percent: null, resets_at: null };
     }
   }
   return summary;
-}
-
-function codexNewestObservedAtMs(rateLimits) {
-  const stamps = [rateLimits?.primary?.observed_at, rateLimits?.secondary?.observed_at]
-    .filter((value) => Number.isFinite(value))
-    .map((value) => value * 1000);
-  return stamps.length ? Math.max(...stamps) : null;
 }
 
 function formatAge(ms) {
@@ -527,6 +663,8 @@ function readClaudeUsageCache({ maxAgeMs }) {
     return {
       available: true,
       fetchedAt: typeof cached.fetchedAt === "string" ? cached.fetchedAt : null,
+      source: cached.source,
+      attemptId: cached.attemptId,
       fiveHour: normalizeClaudeLimit(cached.fiveHour),
       weekAll: normalizeClaudeLimit(cached.weekAll),
       weekScoped: { ...normalizeClaudeLimit(scoped), label: scoped?.label || (cached.weekSonnet ? "Sonnet" : null) },
@@ -537,99 +675,117 @@ function readClaudeUsageCache({ maxAgeMs }) {
 }
 
 function writeClaudeUsageCache(official) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${CLAUDE_USAGE_CACHE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(official, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, CLAUDE_USAGE_CACHE);
+}
+
+function recentCodexFiles() {
+  const files = [];
+  let count = 0, overflow = false;
+  const visit = dir => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (overflow) return;
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile() && /^rollout-.*\.jsonl$/.test(entry.name)) {
+        if (++count > 5000) { overflow = true; return; }
+        try {
+          const stat = fs.statSync(file);
+          if (nowMs - stat.mtimeMs <= 2 * 86400000) files.push({ file, mtime: stat.mtimeMs });
+        } catch {}
+      }
+    }
+  };
+  visit(CODEX_ROOT);
+  if (overflow) {
+    // Bounded metadata fallback: above 5000 rollout files, only creation directories
+    // from the last 30 calendar days are inspected. Older resumed sessions may be
+    // unavailable in this exceptional case. No file contents are read here.
+    files.length = 0;
+    for (let offset = 0; offset < 30; offset++) {
+      const day = new Date(nowMs); day.setDate(day.getDate() - offset);
+      const dir = path.join(CODEX_ROOT, String(day.getFullYear()), String(day.getMonth() + 1).padStart(2, "0"), String(day.getDate()).padStart(2, "0"));
+      try {
+        for (const name of fs.readdirSync(dir)) {
+          if (!/^rollout-.*\.jsonl$/.test(name)) continue;
+          const file = path.join(dir, name);
+          try {
+            const stat = fs.statSync(file);
+            if (stat.isFile() && nowMs - stat.mtimeMs <= 2 * 86400000) files.push({ file, mtime: stat.mtimeMs });
+          } catch {}
+        }
+      } catch {}
+    }
+  }
+  return files.sort((a,b) => b.mtime - a.mtime).slice(0,5).map(entry => entry.file);
+}
+
+function lastCodexRateLimitEvent(file) {
+  let fd;
   try {
-    fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
-    const tmp = `${CLAUDE_USAGE_CACHE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, `${JSON.stringify(official, null, 2)}\n`, { mode: 0o600 });
-    fs.renameSync(tmp, CLAUDE_USAGE_CACHE);
-  } catch {}
+    fd = fs.openSync(file, "r");
+    let position = fs.fstatSync(fd).size, carry = Buffer.alloc(0);
+    // Decode only complete lines: a multibyte character may straddle read boundaries.
+    while (position > 0) {
+      const length = Math.min(position, 65536); position -= length;
+      const block = Buffer.alloc(length); fs.readSync(fd, block, 0, length, position);
+      const data = Buffer.concat([block, carry]);
+      let end = data.length;
+      for (let i = data.length - 1; i >= 0; i--) {
+        if (data[i] !== 10) continue;
+        const line = data.subarray(i + 1, end).toString("utf8"); end = i;
+        const event = parseCodexRateLimitEvent(line);
+        if (event) return event;
+      }
+      carry = data.subarray(0, end);
+    }
+    return parseCodexRateLimitEvent(carry.toString("utf8"));
+  } catch { return null; } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function parseCodexRateLimitEvent(line) {
+  try {
+    const row = JSON.parse(line), ts = Date.parse(row.timestamp || "");
+    if (row?.payload?.type !== "token_count" || !row.payload.rate_limits || !Number.isFinite(ts) || ts > nowMs + 5000 || ts < nowMs - 2*86400000) return null;
+    const windows = [row.payload.rate_limits.primary, row.payload.rate_limits.secondary].map(classifyCodexWindow).filter(Boolean);
+    if (!windows.length) return null;
+    const toLimit = kind => {
+      const w = windows.find(w => w.kind === kind);
+      if (!w) return null;
+      return Number.isFinite(w.resets_at) ? normalizeClaudeLimit({ usedPercent: w.used_percent, resetsAt: w.resets_at }) : { usedPercent: null, resetsAt: null };
+    };
+    return { available: true, source: "session_record", fetchedAt: new Date(ts).toISOString(), fiveHour: toLimit("five"), week: toLimit("week") };
+  } catch { return null; }
+}
+
+function chooseCodexObservation(official, recorded) {
+  const candidates = [official, recorded].filter(value => value?.available && !value.error && value.cache !== "stale" && isUsableObservation(value));
+  return candidates.sort((a,b) => Date.parse(b.fetchedAt) - Date.parse(a.fetchedAt))[0] || official;
 }
 
 async function summarizeCodex() {
-  const hour = emptyBucket();
-  const week = emptyBucket();
-  // Live quota first; the log scan below is the fallback for when there is no usable
-  // Codex login (token missing or expired).
-  const official = await fetchCodexOfficialUsage({ force: process.argv.includes("--refresh") || process.argv.includes("--refresh-codex") });
-  if (official.available) return { hour, week, latestAt: Date.parse(official.fetchedAt) || 0, official, rateLimits: buildCodexRateLimits(null, null, official), filesScanned: 0 };
-  let files = await walkJsonlFiles(CODEX_ROOT, QUOTA_ONLY ? nowMs - 12 * 60 * 60 * 1000 : CODEX_SCAN_SINCE_MS);
-  if (QUOTA_ONLY && files.length === 0) files = await walkJsonlFiles(CODEX_ROOT, CODEX_SCAN_SINCE_MS);
-  // Codex writes rate-limit snapshots in inconsistent shapes: the 5-hour and weekly
-  // windows are NOT always in fixed primary/secondary slots, some records carry only
-  // one window, and multiple auth contexts interleave. Classify every window by its
-  // window_minutes and collect 5-hour and weekly readings independently, then lock
-  // each onto the main account (most-used recent reading). Immune to slot swaps,
-  // partial records, and account flip-flop.
-  const fiveHourReadings = [];
-  const weeklyReadings = [];
-
-  for (const file of files) {
-    await readJsonLines(file, async (row) => {
-      if (row?.payload?.type !== "token_count") return;
-      const timestamp = Date.parse(row.timestamp || "");
-      if (!Number.isFinite(timestamp)) return;
-      if (row.payload.rate_limits) {
-        collectCodexWindows(row.payload.rate_limits, timestamp, fiveHourReadings, weeklyReadings);
-      }
-    });
-  }
-
-  const five = pickCurrentReading(fiveHourReadings);
-  const weekly = pickCurrentReading(weeklyReadings);
-  return {
-    hour,
-    week,
-    latestAt: Math.max(five?.ts || 0, weekly?.ts || 0),
-    official,
-    rateLimits: buildCodexRateLimits(five, weekly, official),
-    fiveHourReadings: fiveHourReadings.length,
-    weeklyReadings: weeklyReadings.length,
-    filesScanned: files.length,
-  };
+  const hour = emptyBucket(), week = emptyBucket();
+  const live = await fetchCodexOfficialUsage({ force: process.argv.includes("--refresh") || process.argv.includes("--refresh-codex") });
+  const files = recentCodexFiles();
+  const records = files.map(lastCodexRateLimitEvent).filter(Boolean).sort((a,b) => Date.parse(b.fetchedAt) - Date.parse(a.fetchedAt));
+  const official = chooseCodexObservation(live, records[0]);
+  return { hour, week, latestAt: Date.parse(official?.fetchedAt) || 0, official,
+    rateLimits: buildCodexRateLimits(null, null, official), filesScanned: files.length };
 }
 
-// Classify a rate-limit window by window_minutes: ~5 hours (<= 360) vs weekly
-// (>= 3 days). Returns null without a usable percentage so partial/garbled records
-// contribute nothing rather than corrupting a slot.
 function classifyCodexWindow(window) {
   if (!window || typeof window !== "object") return null;
   const used = window.used_percent;
   if (!Number.isFinite(used)) return null;
   const wm = Number(window.window_minutes);
-  if (!Number.isFinite(wm)) return null;
+  if (!Number.isFinite(wm) || wm <= 0) return null;
   if (wm <= 360) return { kind: "five", used_percent: used, resets_at: window.resets_at };
   if (wm >= 4320) return { kind: "week", used_percent: used, resets_at: window.resets_at };
   return null;
-}
-
-// Codex does not reliably keep 5h in primary and weekly in secondary, so read every
-// slot and route by classification instead of position.
-function collectCodexWindows(rateLimits, ts, fiveHourReadings, weeklyReadings) {
-  for (const slot of [rateLimits?.primary, rateLimits?.secondary]) {
-    const c = classifyCodexWindow(slot);
-    if (!c) continue;
-    const reading = { ts, used_percent: c.used_percent, resets_at: c.resets_at };
-    (c.kind === "five" ? fiveHourReadings : weeklyReadings).push(reading);
-  }
-}
-
-// Report the account's CURRENT window while resisting multi-account flip-flop. The
-// local logs interleave several rate-limit streams (main account plus stale or
-// auxiliary ones). Anchor on the newest reading and look only at readings written in
-// the ~90s around it — the actively-used account writes every few seconds, so a
-// stream that stopped writing minutes ago (a stale/previous window) falls out of
-// this tight cluster. Within the cluster take the most-used, so a genuinely
-// concurrent auxiliary credential's momentary 0% cannot mask the real high reading.
-function pickCurrentReading(readings) {
-  if (!readings.length) return null;
-  const ACTIVE_WINDOW_MS = 6 * 60 * 60 * 1000;
-  const CLUSTER_MS = 90 * 1000;
-  const recent = readings.filter((r) => nowMs - r.ts <= ACTIVE_WINDOW_MS);
-  const pool = recent.length ? recent : readings;
-  const newestTs = Math.max(...pool.map((r) => r.ts));
-  const cluster = pool.filter((r) => newestTs - r.ts <= CLUSTER_MS);
-  cluster.sort((a, b) => b.used_percent - a.used_percent || b.ts - a.ts);
-  return cluster[0];
 }
 
 function buildCodexRateLimits(five, weekly, official) {
@@ -710,9 +866,8 @@ function buildText(summary) {
   // Codex snapshots only appear when the Codex CLI runs, so they can be hours old while
   // the desktop app shows something quite different. Label the age instead of implying
   // the number is live.
-  const codexObservedAtMs = codexNewestObservedAtMs(x.rateLimits);
-  const codexAge = codexObservedAtMs && nowMs - codexObservedAtMs > 15 * 60 * 1000
-    ? T.dataAge(formatAge(nowMs - codexObservedAtMs))
+  const codexAge = x.official?.source === "session_record"
+    ? (LANG === "en" ? " (last record " : "（最後紀錄 ") + new Date(x.official.fetchedAt).toLocaleTimeString(T.locale, { hour: "2-digit", minute: "2-digit", hour12: false }) + (LANG === "en" ? ")" : "）")
     : "";
   // "no such window on this plan" is a different fact from "could not read it", and the
   // live endpoint can tell them apart: it reports the absent window explicitly.
@@ -874,7 +1029,7 @@ import AppKit
 
 struct UsageSummary: Decodable { let generatedAt: String; let claude: ClaudeSummary; let codex: CodexSummary }
 struct ClaudeSummary: Decodable { let official: ClaudeOfficial? }
-struct ClaudeOfficial: Decodable { let available: Bool?; let fetchedAt: String?; let cache: String?; let error: String?; let fiveHour: ClaudeLimit?; let weekAll: ClaudeLimit?; let weekScoped: ClaudeScopedLimit? }
+struct ClaudeOfficial: Decodable { let source: String?; let available: Bool?; let fetchedAt: String?; let cache: String?; let error: String?; let fiveHour: ClaudeLimit?; let weekAll: ClaudeLimit?; let weekScoped: ClaudeScopedLimit? }
 struct ClaudeLimit: Decodable { let usedPercent: Double?; let resetsAt: Double? }
 // The scoped weekly window names its own model, so the row label comes from the data
 // rather than being hardcoded — it reads "Fable" or "Sonnet" depending on the account.
@@ -882,7 +1037,7 @@ struct ClaudeScopedLimit: Decodable { let usedPercent: Double?; let resetsAt: Do
 struct CodexSummary: Decodable { let rateLimits: RateLimits?; let official: CodexOfficial? }
 // available with a nil window means the plan genuinely has no such limit — distinct from
 // being unable to read it, which leaves available false.
-struct CodexOfficial: Decodable { let fetchedAt: String?; let cache: String?; let error: String?; let available: Bool?; let fiveHour: CodexLimit?; let week: CodexLimit? }
+struct CodexOfficial: Decodable { let source: String?; let fetchedAt: String?; let cache: String?; let error: String?; let available: Bool?; let fiveHour: CodexLimit?; let week: CodexLimit? }
 struct CodexLimit: Decodable { let usedPercent: Double?; let resetsAt: Double? }
 struct RateLimits: Decodable { let primary: RateLimitWindow?; let secondary: RateLimitWindow? }
 struct RateLimitWindow: Decodable { let used_percent: Double?; let resets_at: Double?; let observed_at: Double? }
@@ -1614,8 +1769,8 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         let primary = summary.codex.rateLimits?.primary
         let secondary = summary.codex.rateLimits?.secondary
         let claude = summary.claude.official
-        let codexFresh = summary.codex.official?.available == true && isFresh(summary.codex.official?.fetchedAt)
-        let claudeFresh = claude?.available == true && isFresh(claude?.fetchedAt)
+        let codexFresh = summary.codex.official?.available == true && isFresh(summary.codex.official?.fetchedAt, source: summary.codex.official?.source)
+        let claudeFresh = claude?.available == true && isFresh(claude?.fetchedAt, source: claude?.source)
         let codexFiveRemaining = codexFresh ? remainingPercent(fromUsed: primary?.used_percent) : nil
         let codexWeekRemaining = codexFresh ? remainingPercent(fromUsed: secondary?.used_percent) : nil
         let claudeFiveRemaining = claudeFresh ? remainingPercent(fromUsed: claude?.fiveHour?.usedPercent) : nil
@@ -1642,7 +1797,11 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         }
         // Codex snapshots come from Codex CLI runs only, so they can be hours stale while
         // the Codex app shows a different number. Say so rather than looking live.
-        titleLabel.stringValue = strings.codexTitle + freshnessSuffix(codexFresh)
+        let recorded = summary.codex.official?.source == "session_record" && codexFresh
+        let recordTitle = Language.preference.resolved == .english ? "Codex · recorded " : "Codex · 最後紀錄 "
+        titleLabel.stringValue = recorded
+            ? recordTitle + formatGeneratedAt(summary.codex.official?.fetchedAt ?? "")
+            : strings.codexTitle + freshnessSuffix(codexFresh)
         claudeTitle.stringValue = strings.claudeTitle + freshnessSuffix(claudeFresh)
         if codexFresh && claudeFresh {
             // Show the older vendor observation, not the time a cached report was generated.
@@ -1653,13 +1812,14 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func isFresh(_ timestamp: String?) -> Bool {
+    private func isFresh(_ timestamp: String?, source: String? = nil) -> Bool {
         guard let timestamp else { return false }
         let parser = ISO8601DateFormatter()
         parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         guard let date = parser.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) else { return false }
         let age = Date().timeIntervalSince(date)
-        return age >= -60 && age <= 180
+        let lifetime: Double = source == "session_record" ? 172800 : ((source?.hasPrefix("oauth_") ?? false) ? 600 : 180)
+        return age >= -5 && age <= lifetime
     }
 
     private func freshnessSuffix(_ fresh: Bool) -> String {
@@ -1784,6 +1944,7 @@ func runHeadless(_ command: String) -> Never {
                 // Worst case for the titles is the Codex one with a stale-data suffix.
                 ("codexTitle", strings.codexTitle + " · 12h", Metrics.titleWidth, title),
                 ("claudeTitle", strings.claudeTitle, Metrics.titleWidth, title),
+                ("codexRecordTitle", (language == .english ? "Codex · recorded " : "Codex · 最後紀錄 ") + "23:59", Metrics.titleWidth, title),
                 ("remainingHeader", strings.remainingHeader, Metrics.percentWidth, caption),
                 ("resetHeader", strings.resetHeader, Metrics.resetWidth, caption),
                 ("fiveHour", strings.fiveHour, Metrics.labelWidth, row),
