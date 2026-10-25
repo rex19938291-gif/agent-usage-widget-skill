@@ -306,59 +306,74 @@ function parseRetryAfter(value, at = Date.now()) {
   return at + Math.min(delay, CLAUDE_USAGE_RETRY_CAP_MS);
 }
 
-// A second, lock-free record of the 429 wait. It survives a failed or contended
-// poll-state write, and the claim always honours the later of the two.
-const CLAUDE_RETRY_MARKER = path.join(CACHE_DIR, "claude-usage-retry-at.json");
+// A second, lock-free record of the 429 wait: one file per attempt and deadline,
+// created exclusively ("wx") and never rewritten, so a slow process can never replace
+// a later deadline written by another one. Readers take the latest unexpired record.
+const CLAUDE_RETRY_DIR = path.join(CACHE_DIR, "claude-retry");
 function readClaudeRetryMarker() {
-  try {
-    const value = JSON.parse(fs.readFileSync(CLAUDE_RETRY_MARKER, "utf8"))?.usageRetryAt;
-    return Number.isFinite(value) && value > Date.now() ? value : null;
-  } catch { return null; }
+  let latest = null;
+  let names = [];
+  try { names = fs.readdirSync(CLAUDE_RETRY_DIR); } catch { return null; }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(CLAUDE_RETRY_DIR, name);
+    try {
+      const value = JSON.parse(fs.readFileSync(file, "utf8"))?.usageRetryAt;
+      if (!Number.isFinite(value)) continue;
+      if (value <= Date.now()) { try { fs.unlinkSync(file); } catch {} continue; }
+      if (latest === null || value > latest) latest = value;
+    } catch { /* A file still being written or unreadable is skipped, never trusted. */ }
+  }
+  return latest;
 }
-function writeClaudeRetryMarker(retryAt) {
+function writeClaudeRetryMarker(attemptId, retryAt) {
   try {
-    const keep = readClaudeRetryMarker() || 0;
-    fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
-    const tmp = `${CLAUDE_RETRY_MARKER}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ usageRetryAt: Math.max(keep, retryAt) }), { mode: 0o600 });
-    fs.renameSync(tmp, CLAUDE_RETRY_MARKER);
+    if (!Number.isFinite(retryAt) || !/^[A-Za-z0-9-]{1,80}$/.test(String(attemptId))) return false;
+    fs.mkdirSync(CLAUDE_RETRY_DIR, { recursive: true, mode: 0o700 });
+    const file = path.join(CLAUDE_RETRY_DIR, `${attemptId}-${Math.round(retryAt)}.json`);
+    try {
+      fs.writeFileSync(file, JSON.stringify({ usageRetryAt: retryAt }), { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      // The same attempt already recorded this exact deadline.
+      if (error?.code !== "EEXIST") throw error;
+    }
     return true;
   } catch { return false; }
 }
 
-// Persist a 429 wait the moment it arrives, under the same ownership rule as results:
-// a crash, a later failure or another process taking over must not shorten it.
-// Returns false when the poll state could not be updated (write error, or the lock
-// stayed busy for about a second); the caller must then stop this round.
+// Persist a 429 wait the moment it arrives. Two independent records: a per-attempt
+// file, and the poll state under the usual ownership rule. Either one surviving
+// protects the deadline; only when both fail does this return false, and the
+// caller must then stop this round.
 function persistClaudeRetryAt(attempt, retryAt) {
   if (!Number.isFinite(retryAt)) return true;
   attempt.usageRetryAt = Math.max(retryAt, Number.isFinite(attempt.usageRetryAt) ? attempt.usageRetryAt : 0);
-  writeClaudeRetryMarker(attempt.usageRetryAt);
+  const recordSaved = writeClaudeRetryMarker(attempt.attemptId, attempt.usageRetryAt) === true;
   for (let i = 0; i < 20; i++) {
     const result = withClaudePollLock(() => {
       const current = readClaudePollState();
-      // Superseded: the new owner carries the wait from the marker; nothing to write.
-      if (current?.attemptId !== attempt.attemptId || current.state !== "in_progress") return { ok: true };
+      // Superseded: this attempt no longer owns the state, so only the record counts.
+      if (current?.attemptId !== attempt.attemptId || current.state !== "in_progress") return { ok: false };
       const keep = Number.isFinite(current.usageRetryAt) ? current.usageRetryAt : 0;
       try { writeClaudePollState({ ...current, usageRetryAt: Math.max(keep, attempt.usageRetryAt) }); return { ok: true }; }
       catch { return { ok: false }; }
     });
-    if (!result?.busy) return result.ok === true;
+    if (!result?.busy) return recordSaved || result.ok === true;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
-  return false;
+  return recordSaved;
 }
 
 class ClaudeRetryPersistError extends Error {}
 
-async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, onRetryAt = () => {} } = {}) {
+async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, skipUsage = false, onRetryAt = () => {} } = {}) {
   const credential = readClaudeLongLivedLogin();
   if (!credential) return { official: null, usageRetryAt };
   const headers = { authorization: `Bearer ${credential}`, "anthropic-beta": "oauth-2025-04-20",
     "user-agent": claudeCliUserAgent() };
   let official;
   let retryAt = Number.isFinite(usageRetryAt) && usageRetryAt > Date.now() ? usageRetryAt : null;
-  if (!retryAt) {
+  if (!retryAt && !skipUsage) {
     try {
       const usage = await fetch("https://api.anthropic.com/api/oauth/usage", {
         headers: { ...headers, "content-type": "application/json" }, redirect: "error", signal: AbortSignal.timeout(8000),
@@ -462,7 +477,11 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
       ...(() => {
         const fromState = Number.isFinite(state?.usageRetryAt) && state.usageRetryAt > Date.now() ? state.usageRetryAt : 0;
         const wait = Math.max(fromState, readClaudeRetryMarker() || 0);
-        return wait > 0 ? { usageRetryAt: wait } : {};
+        if (wait > 0) return { usageRetryAt: wait };
+        // Taking over an abandoned attempt that left no deadline anywhere: it may have
+        // received a 429 it could not record. Treat the wait as unknown and skip the
+        // official usage endpoint (and the web-login source) for this one round.
+        return state?.state === "in_progress" ? { waitUnknown: true } : {};
       })() };
     try { writeClaudePollState(attempt); } catch {
       claudeCacheRejected = true;
@@ -487,6 +506,7 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
   if (!claim.skipLongLived) {
     try {
       const result = await fetchClaudeLongLivedUsage(cached, { usageRetryAt: claim.attempt.usageRetryAt,
+        skipUsage: claim.attempt.waitUnknown === true,
         onRetryAt: retryAt => persistClaudeRetryAt(claim.attempt, retryAt) });
       official = result.official;
       if (!Number.isFinite(result.usageRetryAt) && !(claim.attempt.usageRetryAt > Date.now())) delete claim.attempt.usageRetryAt;
@@ -501,7 +521,8 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
   }
   // While the official usage endpoint has asked us to wait, do not turn to the
   // claude.ai web-login source either.
-  const waiting = Number.isFinite(claim.attempt.usageRetryAt) && claim.attempt.usageRetryAt > Date.now();
+  const waiting = claim.attempt.waitUnknown === true ||
+    (Number.isFinite(claim.attempt.usageRetryAt) && claim.attempt.usageRetryAt > Date.now());
   if (!official?.available && !waiting) {
     try { official = await fetchClaudeCookieUsage(cached); } catch {}
   }

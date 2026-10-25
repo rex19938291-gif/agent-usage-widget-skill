@@ -149,7 +149,13 @@ test('the tenth minute permits a new OAuth polling cycle', t => {
   fs.writeFileSync(path.join(f.install,'.cache/claude-oauth-poll.json'), JSON.stringify({attemptId:'pending-attempt',state:'in_progress',startedAt:stamp}));
   oauthMock(f,200,headersAt());
   assert.equal(JSON.parse(f.run('--refresh-claude')).claude.official.fiveHour.usedPercent,39);
-  assert.equal(Number(fs.readFileSync(path.join(f.home,'request-count'))),2);
+  // 接手一個沒留下任何等待期限的失聯嘗試：等待未知，本輪只用標頭（1 次請求）。
+  assert.equal(Number(fs.readFileSync(path.join(f.home,'request-count'))),1);
+  // 下一輪恢復正常：官方用量＋標頭。
+  const statePath=path.join(f.install,'.cache/claude-oauth-poll.json');
+  const s=JSON.parse(fs.readFileSync(statePath)); s.startedAt=s.longLivedStartedAt=Date.now()-601000; fs.writeFileSync(statePath,JSON.stringify(s));
+  f.run('--refresh-claude');
+  assert.equal(Number(fs.readFileSync(path.join(f.home,'request-count'))),3);
 });
 test('OAuth usage success skips messages and uses scoped model data', t => {
   const f=fixture(t);
@@ -671,34 +677,83 @@ fetch = async url => {
 function restartAfterLease(f) {
   const statePath = path.join(f.install, '.cache/claude-oauth-poll.json');
   const s = JSON.parse(fs.readFileSync(statePath));
-  assert.equal(s.state, 'in_progress');
   s.startedAt = s.longLivedStartedAt = Date.now() - 601000; fs.writeFileSync(statePath, JSON.stringify(s));
   retryFailureRun(f, '');
   f.run('--refresh-claude');
   assert.equal(count(f, 'usage-count'), 1);
   assert.equal(count(f, 'cookie-count'), 0);
 }
-test('429 保存: 輪詢狀態寫入失敗時本輪立即停止，再啟動 10 分鐘仍不查官方用量', t => {
+test('429 保存: 輪詢狀態寫入失敗但個別紀錄成功，本輪只用標頭、重啟 10 分鐘仍不查官方用量', t => {
   const f = fixture(t);
   retryFailureRun(f, `const realWrite = writeClaudePollState;
-writeClaudePollState = state => { if (Number.isFinite(state.usageRetryAt)) throw new Error('disk full'); return realWrite(state); };`);
+writeClaudePollState = state => { if (Number.isFinite(state.usageRetryAt) && state.state === 'in_progress') throw new Error('disk full'); return realWrite(state); };`);
   const data = JSON.parse(f.run('--refresh-claude'));
-  assert.equal(data.claude.official.available, false);
-  assert.equal(data.claude.official.error, 'retry_persist_failed');
-  assert.equal(count(f, 'messages-count'), 0);
+  assert.equal(data.claude.official.fiveHour.usedPercent, 39);
+  assert.equal(count(f, 'messages-count'), 1);
   assert.equal(count(f, 'cookie-count'), 0);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'))).usageRetryAt, undefined);
+  assert.equal(fs.readdirSync(path.join(f.install, '.cache/claude-retry')).length, 1);
   restartAfterLease(f);
 });
-test('429 保存: 鎖被占用超過 1 秒時本輪立即停止，再啟動 10 分鐘仍不查官方用量', t => {
+test('429 保存: 鎖被占用超過 1 秒但個別紀錄成功，重啟 10 分鐘仍不查官方用量', t => {
   const f = fixture(t);
   retryFailureRun(f, `beforeRetry = () => fs.mkdirSync(CLAUDE_POLL_STATE + '.lock');`);
-  const data = JSON.parse(f.run('--refresh-claude'));
-  assert.equal(data.claude.official.error, 'retry_persist_failed');
-  assert.equal(count(f, 'messages-count'), 0);
+  f.run('--refresh-claude');
   assert.equal(count(f, 'cookie-count'), 0);
   fs.rmdirSync(path.join(f.install, '.cache/claude-oauth-poll.json.lock'));
   restartAfterLease(f);
+});
+test('429 保存: 個別紀錄與輪詢狀態都寫不進時本輪立即停止，失聯接手時保守跳過官方用量一次', t => {
+  const f = fixture(t);
+  retryFailureRun(f, `writeClaudeRetryMarker = () => false;
+const realWrite = writeClaudePollState;
+writeClaudePollState = state => { if (Number.isFinite(state.usageRetryAt)) throw new Error('disk full'); return realWrite(state); };`);
+  const data = JSON.parse(f.run('--refresh-claude'));
+  assert.equal(data.claude.official.error, 'retry_persist_failed');
+  assert.equal(count(f, 'messages-count'), 0);
+  assert.equal(count(f, 'cookie-count'), 0);
+  const statePath = path.join(f.install, '.cache/claude-oauth-poll.json');
+  const s = JSON.parse(fs.readFileSync(statePath));
+  assert.equal(s.state, 'in_progress');
+  assert.equal(s.usageRetryAt, undefined);
+  restartAfterLease(f);
+  assert.equal(count(f, 'messages-count'), 1);
+});
+test('429 保存: 所有權已更換且個別紀錄寫失敗時不得回成功', t => {
+  const f = fixture(t);
+  f.mock(`writeClaudeRetryMarker = () => false;
+main = async () => {
+  writeClaudePollState({attemptId: 'someone-else', state: 'in_progress', startedAt: Date.now()});
+  const lost = persistClaudeRetryAt({attemptId: 'mine'}, Date.now() + 3600000);
+  writeClaudeRetryMarker = (...a) => realMarker(...a);
+  const kept = persistClaudeRetryAt({attemptId: 'mine2'}, Date.now() + 3600000);
+  process.stdout.write(JSON.stringify({lost, kept}));
+};`);
+  // 第二次呼叫要用真的寫檔函式：在注入前先保存原函式。
+  const script = fs.readFileSync(f.script, 'utf8').replace('writeClaudeRetryMarker = () => false;', 'const realMarker = writeClaudeRetryMarker; writeClaudeRetryMarker = () => false;');
+  fs.writeFileSync(f.script, script);
+  assert.deepEqual(JSON.parse(f.run()), {lost: false, kept: true});
+});
+test('429 保存: 兩程序交錯時舊程序較短的期限不會蓋掉較晚的六小時期限', t => {
+  const f = fixture(t);
+  const sixHours = Date.now() + 6 * 3600000;
+  const withMain = code => { f.mock(`main = async () => { ${code} };`); return fs.readFileSync(f.script, 'utf8'); };
+  // B：另一個程序，寫入六小時期限。
+  const bScript = f.script.replace(/\.js$/, '.b.js');
+  fs.writeFileSync(bScript, withMain(`if (!writeClaudeRetryMarker('B-attempt', ${sixHours})) process.exit(3);`));
+  // A：先讀到舊值（無）後暫停，期間 B 完整執行，A 恢復後寫入自己較短的一小時期限。
+  withMain(`const before = readClaudeRetryMarker();
+require('child_process').execFileSync(process.execPath, [${JSON.stringify(bScript)}], {env: process.env, stdio: 'ignore'});
+const wrote = writeClaudeRetryMarker('A-attempt', Date.now() + 3600000);
+process.stdout.write(JSON.stringify({before, wrote}));`);
+  assert.deepEqual(JSON.parse(f.run()), {before: null, wrote: true});
+  withMain(`process.stdout.write(JSON.stringify(readClaudeRetryMarker()));`);
+  assert.equal(JSON.parse(f.run()), sixHours);
+  // 同一嘗試重寫同一期限不會出錯；過期紀錄讀取時順手刪除，不影響六小時。
+  withMain(`writeClaudeRetryMarker('C-attempt', Date.now() - 1000); process.stdout.write(JSON.stringify(writeClaudeRetryMarker('B-attempt', ${sixHours})));`);
+  assert.equal(JSON.parse(f.run()), true);
+  withMain(`process.stdout.write(JSON.stringify(readClaudeRetryMarker()));`);
+  assert.equal(JSON.parse(f.run()), sixHours);
+  assert.equal(fs.readdirSync(path.join(f.install, '.cache/claude-retry')).length, 2);
 });
 test('便宜 P2: 模型百分比只收 0～100，名稱含換行或控制字元改中性名稱', t => {
   const iso = s => new Date(Date.now() + s * 1000).toISOString();
@@ -788,7 +843,7 @@ test('Fable 每週欄: 429 的 retry-after 會被遵守，手動更新也不提�
   const after = JSON.parse(fs.readFileSync(statePath));
   assert.equal(after.usageRetryAt, s.usageRetryAt);
   after.usageRetryAt = Date.now() - 1000; after.startedAt = after.longLivedStartedAt = Date.now() - 601000; fs.writeFileSync(statePath, JSON.stringify(after));
-  fs.rmSync(path.join(f.install, '.cache/claude-usage-retry-at.json'));
+  fs.rmSync(path.join(f.install, '.cache/claude-retry'), {recursive: true, force: true});
   scopedMock(f, {usageBody: limitsBody()});
   assert.equal(JSON.parse(f.run('--refresh-claude')).claude.official.weekScoped.usedPercent, 25);
   assert.equal(count(f, 'usage-count'), 2);
