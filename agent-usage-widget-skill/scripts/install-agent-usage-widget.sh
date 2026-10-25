@@ -182,6 +182,14 @@ async function summarizeClaude() {
 }
 
 const CLAUDE_POLL_MS = 10 * 60 * 1000;
+// The weekly per-model window (e.g. Fable) only comes from /api/oauth/usage; the
+// messages-header fallback has no such field. While that endpoint is rate limited, the
+// scoped window of the immediately preceding verified oauth/usage success is carried
+// for at most 30 minutes, then it is unknown again.
+const CLAUDE_SCOPED_MAX_MS = 30 * 60 * 1000;
+// A 429 from /api/oauth/usage carries retry-after; obey it (capped) instead of asking
+// again every poll, which only keeps the limiter engaged.
+const CLAUDE_USAGE_RETRY_CAP_MS = 6 * 60 * 60 * 1000;
 const CLAUDE_POLL_STATE = path.join(CACHE_DIR, "claude-oauth-poll.json");
 let claudeCacheRejected = false;
 
@@ -205,8 +213,10 @@ function normalizeClaudeOfficial(data, cached, source) {
   }
   const fiveHour = limits?.fiveHour ?? normalizeClaudeLimit(data?.five_hour);
   const weekAll = limits?.weekAll ?? normalizeClaudeLimit(data?.seven_day);
+  const fetchedAt = new Date().toISOString();
+  if (Number.isFinite(scoped?.usedPercent) && scoped.label) scoped = { ...scoped, fetchedAt };
   return { available: Number.isFinite(fiveHour.usedPercent) || Number.isFinite(weekAll.usedPercent),
-    fetchedAt: new Date().toISOString(), source, fiveHour, weekAll, weekScoped: scoped };
+    fetchedAt, source, fiveHour, weekAll, weekScoped: scoped };
 }
 
 function parseClaudeUsageHeaders(headers, cached) {
@@ -271,18 +281,54 @@ function readVerifiedClaudeCache() {
   return result?.busy ? null : result;
 }
 
-async function fetchClaudeLongLivedUsage(cached) {
-  const credential = readClaudeLongLivedLogin();
-  if (!credential) return null;
-  const headers = { authorization: `Bearer ${credential}`, "anthropic-beta": "oauth-2025-04-20" };
-  let official;
+function claudeCliUserAgent() {
+  // Same shape as Claude Code's own requests; the version follows the installed CLI.
   try {
-    const usage = await fetch("https://api.anthropic.com/api/oauth/usage", {
-      headers, redirect: "error", signal: AbortSignal.timeout(8000),
-    });
-    if (usage.status === 200) official = normalizeClaudeOfficial(await usage.json(), cached, "oauth_usage");
-    else await usage.body?.cancel();
-  } catch { /* The independent messages request must still run. */ }
+    const version = path.basename(fs.readlinkSync(path.join(HOME, ".local/bin/claude")));
+    if (/^\d+\.\d+\.\d+$/.test(version)) return `claude-cli/${version} (external, cli)`;
+  } catch {}
+  return "claude-cli (external, cli)";
+}
+
+// retry-after is either delta-seconds or an HTTP date. Returns an epoch-ms deadline.
+function parseRetryAfter(value, at = Date.now()) {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const seconds = Number(value.trim());
+  const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - at;
+  if (!Number.isFinite(delay) || delay <= 0) return null;
+  return at + Math.min(delay, CLAUDE_USAGE_RETRY_CAP_MS);
+}
+
+// Only the scoped window of the verified success this attempt replaces may be carried,
+// never one from a rejected or superseded attempt, and never past its own lifetime.
+function carriedClaudeScoped(cached, attempt) {
+  const scoped = cached?.weekScoped;
+  if (claudeCacheRejected || !attempt?.previousSuccessId || cached?.attemptId !== attempt.previousSuccessId) return null;
+  if (!Number.isFinite(scoped?.usedPercent) || !Number.isFinite(scoped?.resetsAt) || isWindowExpired(scoped.resetsAt) || !scoped.label) return null;
+  const age = Date.now() - Date.parse(scoped.fetchedAt || "");
+  if (!Number.isFinite(age) || age < -5000 || age > CLAUDE_SCOPED_MAX_MS) return null;
+  return { usedPercent: scoped.usedPercent, resetsAt: scoped.resetsAt, label: scoped.label, fetchedAt: scoped.fetchedAt };
+}
+
+async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, carryScoped = null } = {}) {
+  const credential = readClaudeLongLivedLogin();
+  if (!credential) return { official: null, usageRetryAt };
+  const headers = { authorization: `Bearer ${credential}`, "anthropic-beta": "oauth-2025-04-20",
+    "user-agent": claudeCliUserAgent() };
+  let official;
+  let retryAt = Number.isFinite(usageRetryAt) && usageRetryAt > Date.now() ? usageRetryAt : null;
+  if (!retryAt) {
+    try {
+      const usage = await fetch("https://api.anthropic.com/api/oauth/usage", {
+        headers: { ...headers, "content-type": "application/json" }, redirect: "error", signal: AbortSignal.timeout(8000),
+      });
+      if (usage.status === 200) official = normalizeClaudeOfficial(await usage.json(), cached, "oauth_usage");
+      else {
+        if (usage.status === 429) retryAt = parseRetryAfter(usage.headers?.get?.("retry-after") ?? null);
+        await usage.body?.cancel();
+      }
+    } catch { /* The independent messages request must still run. */ }
+  }
   if (!official?.available) {
     try {
       const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -291,10 +337,11 @@ async function fetchClaudeLongLivedUsage(cached) {
         body: JSON.stringify({ model: "claude-haiku-4-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
       });
       official = parseClaudeUsageHeaders(response.headers, cached);
+      if (official.available && carryScoped) official.weekScoped = carryScoped;
       await response.body?.cancel().catch(() => {});
     } catch { /* Never expose request context or login material. */ }
   }
-  return official?.available ? official : null;
+  return { official: official?.available ? official : null, usageRetryAt: retryAt };
 }
 
 async function fetchClaudeCookieUsage(cached) {
@@ -362,7 +409,8 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
     const skipLongLived = Number.isFinite(state?.longLivedStartedAt) && Date.now() - state.longLivedStartedAt < longLivedInterval;
     const attempt = { attemptId: `${process.pid}-${crypto.randomUUID()}`, state: "in_progress", startedAt: Date.now(),
       previousSuccessId: state?.state === "succeeded" ? state.attemptId : null,
-      longLivedStartedAt: skipLongLived ? state.longLivedStartedAt : Date.now() };
+      longLivedStartedAt: skipLongLived ? state.longLivedStartedAt : Date.now(),
+      ...(Number.isFinite(state?.usageRetryAt) && state.usageRetryAt > Date.now() && { usageRetryAt: state.usageRetryAt }) };
     try { writeClaudePollState(attempt); } catch {
       claudeCacheRejected = true;
       // A failed atomic replacement can still permit in-place invalidation. Under
@@ -384,7 +432,13 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
   }
   let official;
   if (!claim.skipLongLived) {
-    try { official = await fetchClaudeLongLivedUsage(cached); } catch {}
+    try {
+      const result = await fetchClaudeLongLivedUsage(cached, { usageRetryAt: claim.attempt.usageRetryAt,
+        carryScoped: carriedClaudeScoped(cached, claim.attempt) });
+      official = result.official;
+      if (Number.isFinite(result.usageRetryAt)) claim.attempt.usageRetryAt = result.usageRetryAt;
+      else delete claim.attempt.usageRetryAt;
+    } catch {}
   }
   if (!official?.available) {
     try { official = await fetchClaudeCookieUsage(cached); } catch {}
@@ -615,6 +669,12 @@ function enforceFreshUsage(summary) {
     for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
       if (official[key]) official[key] = { ...official[key], ...normalizeClaudeLimit(official[key]) };
     }
+    // A carried scoped window keeps its own observation time and lifetime.
+    const scoped = official.weekScoped;
+    if (vendor === "claude" && scoped && "fetchedAt" in scoped) {
+      const age = nowMs - Date.parse(scoped.fetchedAt || "");
+      if (!Number.isFinite(age) || age < -5000 || age > CLAUDE_SCOPED_MAX_MS) official.weekScoped = { ...scoped, usedPercent: null, resetsAt: null };
+    }
     if (official.available && !official.error && official.cache !== "stale" && isUsableObservation(official)) continue;
     official.available = false;
     official.error ||= "stale_usage";
@@ -673,7 +733,8 @@ function readClaudeUsageCache({ maxAgeMs }) {
       attemptId: cached.attemptId,
       fiveHour: normalizeClaudeLimit(cached.fiveHour),
       weekAll: normalizeClaudeLimit(cached.weekAll),
-      weekScoped: { ...normalizeClaudeLimit(scoped), label: scoped?.label || (cached.weekSonnet ? "Sonnet" : null) },
+      weekScoped: { ...normalizeClaudeLimit(scoped), label: scoped?.label || (cached.weekSonnet ? "Sonnet" : null),
+        ...(typeof scoped?.fetchedAt === "string" && { fetchedAt: scoped.fetchedAt }) },
     };
   } catch {
     return null;
@@ -1113,7 +1174,7 @@ struct Strings {
         fiveHour: "5 小時",
         oneWeek: "1 週",
         already100: "已是 100%",
-        noWindowOnPlan: "無",
+        noWindowOnPlan: "方案無此窗",
         updating: "更新中…",
         updateFailed: "更新失敗",
         lastUpdated: { "更新 \($0)" },
@@ -1144,7 +1205,7 @@ struct Strings {
         fiveHour: "5 hours",
         oneWeek: "1 week",
         already100: "At 100%",
-        noWindowOnPlan: "None",
+        noWindowOnPlan: "Not on plan",
         updating: "Updating…",
         updateFailed: "Update failed",
         lastUpdated: { "Updated \($0)" },
@@ -1770,11 +1831,20 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             process.arguments = arguments
             let pipe = Pipe()
             process.standardOutput = pipe
-            process.standardError = Pipe()
+            // An unread stderr pipe can fill and block the child forever; discard it.
+            process.standardError = FileHandle.nullDevice
             do {
                 try process.run()
-                process.waitUntilExit()
+                // A hung child must not leave "Updating…" on screen: terminate it after
+                // 45 seconds (its own network requests time out after 8 seconds each),
+                // which ends in the failure branch below and still runs finishRefresh.
+                let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 45, execute: watchdog)
+                // Drain stdout before waiting, so output larger than the pipe buffer
+                // cannot deadlock the child against waitUntilExit.
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                watchdog.cancel()
                 DispatchQueue.main.async {
                     if process.terminationStatus == 0, let summary = try? JSONDecoder().decode(UsageSummary.self, from: data) {
                         self.lastCompletedAt = Date()
@@ -1818,9 +1888,11 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         // The live endpoint distinguishes "this plan has no 5-hour window" from "unknown",
         // so name the absent window rather than showing --% as if the read had failed.
         let codexNoFiveHour = codexFresh && summary.codex.official?.available == true && summary.codex.official?.fiveHour == nil
-        codexFivePercent.stringValue = codexNoFiveHour ? strings.noWindowOnPlan : formatPercent(codexFiveRemaining)
+        // The plan simply has no such window: leave the percent cell empty and say so in
+        // the wider reset cell, instead of a "None / —" pair that reads like a failed read.
+        codexFivePercent.stringValue = codexNoFiveHour ? "" : formatPercent(codexFiveRemaining)
         codexWeekPercent.stringValue = formatPercent(codexWeekRemaining)
-        codexFiveReset.stringValue = codexNoFiveHour ? "—" : formatReset(codexFresh ? primary?.resets_at : nil, compact: false)
+        codexFiveReset.stringValue = codexNoFiveHour ? strings.noWindowOnPlan : formatReset(codexFresh ? primary?.resets_at : nil, compact: false)
         codexWeekReset.stringValue = formatRecovery(codexFresh ? secondary?.resets_at : nil, remaining: codexWeekRemaining, compact: true)
         claudeFivePercent.stringValue = formatPercent(claudeFiveRemaining)
         claudeWeekPercent.stringValue = formatPercent(claudeWeekRemaining)
@@ -1994,7 +2066,7 @@ func runHeadless(_ command: String) -> Never {
                 ("resetDateTime", "12/31 23:59", Metrics.resetWidth, value),
                 ("codexStaleTitle", strings.codexTitle + strings.staleData, Metrics.titleWidth, title),
                 ("claudeStaleTitle", strings.claudeTitle + strings.staleData, Metrics.claudeTitleWidth, title),
-                ("noWindowOnPlan", strings.noWindowOnPlan, Metrics.percentWidth, value),
+                ("noWindowOnPlan", strings.noWindowOnPlan, Metrics.resetWidth, value),
                 ("updating", strings.updating, Metrics.statusMaxWidth, caption),
                 ("updateFailed", strings.updateFailed, Metrics.statusMaxWidth, caption),
                 ("lastUpdated", strings.lastUpdated("23:59"), Metrics.statusMaxWidth, caption),
