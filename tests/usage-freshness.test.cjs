@@ -598,34 +598,126 @@ test('Fable 每週欄: 429 加上被拒絕的一輪不會復活舊的每模型�
   assert.equal(headersOnly.claude.official.weekScoped.usedPercent, null);
   assert.equal(JSON.parse(f.run()).claude.official.weekScoped.usedPercent, null);
 });
-test('Fable 每週欄: 11 分鐘後官方限流、標頭成功時，舊的每模型數字不得出現', t => {
-  const f = fixture(t); scopedMock(f, {usageBody: limitsBody()});
-  JSON.parse(f.run('--refresh-claude'));
-  const statePath = path.join(f.install, '.cache/claude-oauth-poll.json');
-  for (const status of [401, 403, 429, 500]) {
-    const s = JSON.parse(fs.readFileSync(statePath)); s.startedAt = s.longLivedStartedAt = Date.now() - 11 * 60000; delete s.usageRetryAt; fs.writeFileSync(statePath, JSON.stringify(s));
-    scopedMock(f, {usageStatus: status});
-    const data = JSON.parse(f.run('--refresh-claude'));
-    assert.equal(data.claude.official.source, 'oauth_headers', `status ${status}`);
+// 以固定時間執行：在腳本最前面覆寫 Date，讓 Date.now() 與 new Date() 一致可控。
+function runAt(f, at, ...args) {
+  const timed = f.script.replace(/\.js$/, '.timed.js');
+  const prefix = `{ const RealDate = Date; const fixed = Number(process.env.FAKE_NOW);
+global.Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [fixed])); } static now() { return fixed; } }; }\n`;
+  const body = fs.readFileSync(f.script, 'utf8');
+  const shebang = body.startsWith('#!') ? body.slice(0, body.indexOf('\n') + 1) : '';
+  fs.writeFileSync(timed, shebang + prefix + body.slice(shebang.length));
+  return execFileSync(process.execPath, [timed, '--quota-only', ...args], {env: {HOME: f.home, PATH: '/usr/bin:/bin', FAKE_NOW: String(at)}, encoding: 'utf8', timeout: 5000});
+}
+const failureMocks = {
+  401: f => scopedMock(f, {usageStatus: 401}),
+  403: f => scopedMock(f, {usageStatus: 403}),
+  429: f => scopedMock(f, {usageStatus: 429}),
+  500: f => scopedMock(f, {usageStatus: 500}),
+  invalid: f => f.mock(`readClaudeLongLivedLogin = () => "dummy";
+fetch = async url => url.endsWith('/api/oauth/usage') ? {status: 200, json: async () => { throw new Error('bad'); }} : {status: 200, headers: new Headers(${JSON.stringify(headersAt())})};`),
+  connection: f => f.mock(`readClaudeLongLivedLogin = () => "dummy";
+fetch = async url => { if (url.endsWith('/api/oauth/usage')) throw new Error('offline'); return {status: 200, headers: new Headers(${JSON.stringify(headersAt())})}; };`),
+};
+for (const [name, failWith] of Object.entries(failureMocks)) {
+  test(`Fable 每週欄: 成功後 11 分鐘遇到 ${name}，舊的每模型數字不得復活`, t => {
+    const f = fixture(t); const t0 = Date.now();
+    fs.rmSync(path.join(f.install, '.cache/claude-oauth-poll.json'));
+    scopedMock(f, {usageBody: limitsBody()});
+    assert.equal(JSON.parse(runAt(f, t0, '--refresh-claude')).claude.official.weekScoped.usedPercent, 25);
+    failWith(f);
+    const later = t0 + 11 * 60000;
+    const data = JSON.parse(runAt(f, later, '--refresh-claude'));
+    assert.equal(data.claude.official.source, 'oauth_headers');
     assert.equal(data.claude.official.fiveHour.usedPercent, 39);
-    assert.equal(data.claude.official.weekScoped.usedPercent, null, `status ${status}`);
+    assert.equal(data.claude.official.weekScoped.usedPercent, null);
     assert.equal(data.claude.official.weekScoped.resetsAt, null);
     assert.equal(data.claude.official.weekScoped.label, 'Fable');
-  }
+    assert.equal(JSON.parse(runAt(f, later + 1000)).claude.official.weekScoped.usedPercent, null);
+  });
+}
+for (const scopedFetchedAt of [undefined, 35 * 60000]) {
+  test(`舊快取相容: 上一版標頭快取含模型數字（模型觀測時間 ${scopedFetchedAt === undefined ? '缺' : '35 分鐘前'}）交給新版讀，數字不出現`, t => {
+    const f = fixture(t, 6 * 60000);
+    f.claude.source = 'oauth_headers';
+    f.claude.weekScoped = {usedPercent: 25, resetsAt: Date.now() / 1000 + 86400, label: 'Fable',
+      ...(scopedFetchedAt !== undefined && {fetchedAt: new Date(Date.now() - scopedFetchedAt).toISOString()})};
+    f.save();
+    fs.writeFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'), JSON.stringify({attemptId: f.claude.attemptId, state: 'succeeded', startedAt: Date.now() - 6 * 60000}));
+    const data = JSON.parse(f.run());
+    assert.equal(data.claude.official.available, true);
+    assert.equal(data.claude.official.weekAll.usedPercent, 37);
+    assert.equal(data.claude.official.weekScoped.usedPercent, null);
+    assert.equal(data.claude.official.weekScoped.label, 'Fable');
+  });
+}
+test('舊快取相容: 官方用量來源的模型欄若帶超過 10 分鐘的自身觀測時間也清空', t => {
+  const f = fixture(t, 60000); f.claude.source = 'oauth_usage';
+  f.claude.weekScoped.fetchedAt = new Date(Date.now() - 11 * 60000).toISOString(); f.save();
+  assert.equal(JSON.parse(f.run()).claude.official.weekScoped.usedPercent, null);
+  f.claude.weekScoped.fetchedAt = new Date(Date.now() - 60000).toISOString(); f.save();
+  assert.equal(JSON.parse(f.run()).claude.official.weekScoped.usedPercent, 1);
 });
-test('Fable 每週欄: 格式錯誤與連線失敗也不復活舊的每模型數字', t => {
-  const f = fixture(t); scopedMock(f, {usageBody: limitsBody()});
-  JSON.parse(f.run('--refresh-claude'));
-  const statePath = path.join(f.install, '.cache/claude-oauth-poll.json');
-  for (const failure of ['invalid', 'connection']) {
-    const s = JSON.parse(fs.readFileSync(statePath)); s.startedAt = s.longLivedStartedAt = Date.now() - 11 * 60000; fs.writeFileSync(statePath, JSON.stringify(s));
-    f.mock(`readClaudeLongLivedLogin = () => "dummy";
+function retryFailureRun(f, inject) {
+  f.mock(`readClaudeLongLivedLogin = () => "dummy";
+readClaudeDesktopSession = () => ({orgId: 'dummy', cookieHeader: 'dummy'});
+${inject}
 fetch = async url => {
-  if (url.endsWith('/api/oauth/usage')) { if (${JSON.stringify(failure)} === 'connection') throw new Error('offline'); return {status: 200, json: async () => { throw new Error('bad'); }}; }
-  return {status: 200, headers: new Headers(${JSON.stringify(headersAt())})};
+  const counter = path.join(HOME, url.endsWith('/api/oauth/usage') ? 'usage-count' : url.startsWith('https://claude.ai/') ? 'cookie-count' : 'messages-count');
+  fs.writeFileSync(counter, String(Number(fs.existsSync(counter) ? fs.readFileSync(counter, 'utf8') : 0) + 1));
+  if (url.endsWith('/api/oauth/usage')) { if (typeof beforeRetry === 'function') beforeRetry(); return {status: 429, headers: new Headers({'retry-after': '3600'})}; }
+  return {status: 200, ok: true, headers: new Headers(${JSON.stringify(headersAt())}), json: async () => ({five_hour: {utilization: 39, resets_at: nowMs / 1000 + 3600}})};
 };`);
-    assert.equal(JSON.parse(f.run('--refresh-claude')).claude.official.weekScoped.usedPercent, null, failure);
-  }
+}
+function restartAfterLease(f) {
+  const statePath = path.join(f.install, '.cache/claude-oauth-poll.json');
+  const s = JSON.parse(fs.readFileSync(statePath));
+  assert.equal(s.state, 'in_progress');
+  s.startedAt = s.longLivedStartedAt = Date.now() - 601000; fs.writeFileSync(statePath, JSON.stringify(s));
+  retryFailureRun(f, '');
+  f.run('--refresh-claude');
+  assert.equal(count(f, 'usage-count'), 1);
+  assert.equal(count(f, 'cookie-count'), 0);
+}
+test('429 保存: 輪詢狀態寫入失敗時本輪立即停止，再啟動 10 分鐘仍不查官方用量', t => {
+  const f = fixture(t);
+  retryFailureRun(f, `const realWrite = writeClaudePollState;
+writeClaudePollState = state => { if (Number.isFinite(state.usageRetryAt)) throw new Error('disk full'); return realWrite(state); };`);
+  const data = JSON.parse(f.run('--refresh-claude'));
+  assert.equal(data.claude.official.available, false);
+  assert.equal(data.claude.official.error, 'retry_persist_failed');
+  assert.equal(count(f, 'messages-count'), 0);
+  assert.equal(count(f, 'cookie-count'), 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'))).usageRetryAt, undefined);
+  restartAfterLease(f);
+});
+test('429 保存: 鎖被占用超過 1 秒時本輪立即停止，再啟動 10 分鐘仍不查官方用量', t => {
+  const f = fixture(t);
+  retryFailureRun(f, `beforeRetry = () => fs.mkdirSync(CLAUDE_POLL_STATE + '.lock');`);
+  const data = JSON.parse(f.run('--refresh-claude'));
+  assert.equal(data.claude.official.error, 'retry_persist_failed');
+  assert.equal(count(f, 'messages-count'), 0);
+  assert.equal(count(f, 'cookie-count'), 0);
+  fs.rmdirSync(path.join(f.install, '.cache/claude-oauth-poll.json.lock'));
+  restartAfterLease(f);
+});
+test('便宜 P2: 模型百分比只收 0～100，名稱含換行或控制字元改中性名稱', t => {
+  const iso = s => new Date(Date.now() + s * 1000).toISOString();
+  const f = fixture(t); scopedMock(f, {usageBody: {limits: [
+    {kind: 'session', percent: 34, resets_at: iso(3600)},
+    {kind: 'weekly_scoped', percent: 150, resets_at: iso(86400), scope: {model: {display_name: 'Opus'}}},
+    {kind: 'weekly_scoped', percent: -1, resets_at: iso(86400), scope: {model: {display_name: 'Haiku'}}},
+    {kind: 'weekly_scoped', percent: 25, resets_at: iso(86400), scope: {model: {display_name: 'Fa\nble'}}},
+  ]}});
+  const data = JSON.parse(f.run('--refresh-claude'));
+  assert.equal(data.claude.official.weekScoped.usedPercent, 25);
+  assert.equal(data.claude.official.weekScoped.label, '模型');
+  const g = fixture(t); scopedMock(g, {usageBody: {limits: [
+    {kind: 'session', percent: 34, resets_at: iso(3600)},
+    {kind: 'weekly_scoped', percent: 150, resets_at: iso(86400), scope: {model: {display_name: 'Fable\u0007'}}},
+  ]}});
+  const only = JSON.parse(g.run('--refresh-claude'));
+  assert.equal(only.claude.official.weekScoped.usedPercent, null);
+  assert.equal(only.claude.official.weekScoped.label, '模型');
 });
 test('Fable 每週欄: 收到 429 後立即中止，再啟動 10 分鐘後仍不得查詢官方用量與網頁登入', t => {
   const f = fixture(t);
@@ -696,6 +788,7 @@ test('Fable 每週欄: 429 的 retry-after 會被遵守，手動更新也不提�
   const after = JSON.parse(fs.readFileSync(statePath));
   assert.equal(after.usageRetryAt, s.usageRetryAt);
   after.usageRetryAt = Date.now() - 1000; after.startedAt = after.longLivedStartedAt = Date.now() - 601000; fs.writeFileSync(statePath, JSON.stringify(after));
+  fs.rmSync(path.join(f.install, '.cache/claude-usage-retry-at.json'));
   scopedMock(f, {usageBody: limitsBody()});
   assert.equal(JSON.parse(f.run('--refresh-claude')).claude.official.weekScoped.usedPercent, 25);
   assert.equal(count(f, 'usage-count'), 2);

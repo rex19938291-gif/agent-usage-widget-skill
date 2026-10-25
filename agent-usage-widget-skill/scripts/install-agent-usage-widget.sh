@@ -203,6 +203,8 @@ const NEUTRAL_MODEL_LABEL = LANG === "en" ? "Model" : "模型";
 function safeModelLabel(value) {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
+  // Line breaks and control characters would break the one-line row; reject them.
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(trimmed)) return null;
   return trimmed.length > 0 && trimmed.length <= 32 ? trimmed : null;
 }
 
@@ -304,23 +306,50 @@ function parseRetryAfter(value, at = Date.now()) {
   return at + Math.min(delay, CLAUDE_USAGE_RETRY_CAP_MS);
 }
 
+// A second, lock-free record of the 429 wait. It survives a failed or contended
+// poll-state write, and the claim always honours the later of the two.
+const CLAUDE_RETRY_MARKER = path.join(CACHE_DIR, "claude-usage-retry-at.json");
+function readClaudeRetryMarker() {
+  try {
+    const value = JSON.parse(fs.readFileSync(CLAUDE_RETRY_MARKER, "utf8"))?.usageRetryAt;
+    return Number.isFinite(value) && value > Date.now() ? value : null;
+  } catch { return null; }
+}
+function writeClaudeRetryMarker(retryAt) {
+  try {
+    const keep = readClaudeRetryMarker() || 0;
+    fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+    const tmp = `${CLAUDE_RETRY_MARKER}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ usageRetryAt: Math.max(keep, retryAt) }), { mode: 0o600 });
+    fs.renameSync(tmp, CLAUDE_RETRY_MARKER);
+    return true;
+  } catch { return false; }
+}
+
 // Persist a 429 wait the moment it arrives, under the same ownership rule as results:
 // a crash, a later failure or another process taking over must not shorten it.
+// Returns false when the poll state could not be updated (write error, or the lock
+// stayed busy for about a second); the caller must then stop this round.
 function persistClaudeRetryAt(attempt, retryAt) {
-  if (!Number.isFinite(retryAt)) return;
+  if (!Number.isFinite(retryAt)) return true;
   attempt.usageRetryAt = Math.max(retryAt, Number.isFinite(attempt.usageRetryAt) ? attempt.usageRetryAt : 0);
+  writeClaudeRetryMarker(attempt.usageRetryAt);
   for (let i = 0; i < 20; i++) {
     const result = withClaudePollLock(() => {
       const current = readClaudePollState();
-      if (current?.attemptId !== attempt.attemptId || current.state !== "in_progress") return { done: true };
+      // Superseded: the new owner carries the wait from the marker; nothing to write.
+      if (current?.attemptId !== attempt.attemptId || current.state !== "in_progress") return { ok: true };
       const keep = Number.isFinite(current.usageRetryAt) ? current.usageRetryAt : 0;
-      try { writeClaudePollState({ ...current, usageRetryAt: Math.max(keep, attempt.usageRetryAt) }); } catch {}
-      return { done: true };
+      try { writeClaudePollState({ ...current, usageRetryAt: Math.max(keep, attempt.usageRetryAt) }); return { ok: true }; }
+      catch { return { ok: false }; }
     });
-    if (!result?.busy) return;
+    if (!result?.busy) return result.ok === true;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
+  return false;
 }
+
+class ClaudeRetryPersistError extends Error {}
 
 async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, onRetryAt = () => {} } = {}) {
   const credential = readClaudeLongLivedLogin();
@@ -338,11 +367,17 @@ async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, onRetryA
       else {
         if (usage.status === 429) {
           retryAt = parseRetryAfter(usage.headers?.get?.("retry-after") ?? null);
-          onRetryAt(retryAt);
+          if (onRetryAt(retryAt) === false) {
+            await usage.body?.cancel?.().catch?.(() => {});
+            throw new ClaudeRetryPersistError();
+          }
         }
         await usage.body?.cancel();
       }
-    } catch { /* The independent messages request must still run. */ }
+    } catch (error) {
+      if (error instanceof ClaudeRetryPersistError) throw error;
+      /* Otherwise the independent messages request must still run. */
+    }
   }
   if (!official?.available) {
     try {
@@ -424,7 +459,11 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
     const attempt = { attemptId: `${process.pid}-${crypto.randomUUID()}`, state: "in_progress", startedAt: Date.now(),
       previousSuccessId: state?.state === "succeeded" ? state.attemptId : null,
       longLivedStartedAt: skipLongLived ? state.longLivedStartedAt : Date.now(),
-      ...(Number.isFinite(state?.usageRetryAt) && state.usageRetryAt > Date.now() && { usageRetryAt: state.usageRetryAt }) };
+      ...(() => {
+        const fromState = Number.isFinite(state?.usageRetryAt) && state.usageRetryAt > Date.now() ? state.usageRetryAt : 0;
+        const wait = Math.max(fromState, readClaudeRetryMarker() || 0);
+        return wait > 0 ? { usageRetryAt: wait } : {};
+      })() };
     try { writeClaudePollState(attempt); } catch {
       claudeCacheRejected = true;
       // A failed atomic replacement can still permit in-place invalidation. Under
@@ -451,7 +490,14 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
         onRetryAt: retryAt => persistClaudeRetryAt(claim.attempt, retryAt) });
       official = result.official;
       if (!Number.isFinite(result.usageRetryAt) && !(claim.attempt.usageRetryAt > Date.now())) delete claim.attempt.usageRetryAt;
-    } catch {}
+    } catch (error) {
+      if (error instanceof ClaudeRetryPersistError) {
+        // The wait could not be recorded in the poll state: stop every further request
+        // this round and leave the state in_progress until its lease runs out.
+        claudeCacheRejected = true;
+        return unknown("retry_persist_failed");
+      }
+    }
   }
   // While the official usage endpoint has asked us to wait, do not turn to the
   // claude.ai web-login source either.
@@ -641,12 +687,14 @@ function normalizeClaudeLimitsArray(limits) {
   // Several per-model rows may be listed: take the first one that is usable (a percent
   // and a future reset), falling back to the first row so its label is still known.
   const scopedRows = limits.filter((entry) => entry && entry.kind === "weekly_scoped");
-  const scoped = scopedRows.find((entry) => Number.isFinite(toLimit(entry).usedPercent)) || scopedRows[0] || null;
+  const usable = (entry) => { const value = toLimit(entry).usedPercent; return Number.isFinite(value) && value >= 0 && value <= 100; };
+  const scoped = scopedRows.find(usable) || scopedRows[0] || null;
   if (!session && !weeklyAll && !scoped) return null;
   return {
     fiveHour: toLimit(session),
     weekAll: toLimit(weeklyAll),
-    weekScoped: { ...toLimit(scoped), label: scoped ? (safeModelLabel(scoped.scope?.model?.display_name) || NEUTRAL_MODEL_LABEL) : null },
+    weekScoped: { ...(scoped && usable(scoped) ? toLimit(scoped) : { usedPercent: null, resetsAt: null }),
+      label: scoped ? (safeModelLabel(scoped.scope?.model?.display_name) || NEUTRAL_MODEL_LABEL) : null },
   };
 }
 
@@ -739,6 +787,14 @@ function readClaudeUsageCache({ maxAgeMs }) {
     // weekSonnet is the pre-`limits` cache shape; keep reading it so an existing cache
     // written by an older install still renders instead of showing n/a.
     const scoped = cached.weekScoped || cached.weekSonnet || null;
+    // Header observations never carry a per-model window. An older version could merge
+    // a carried one into them, so such numbers are dropped on read; a per-model
+    // observation time of its own must also be present and within ten minutes.
+    let scopedLimit = normalizeClaudeLimit(scoped);
+    const scopedAge = scoped && "fetchedAt" in scoped ? nowMs - Date.parse(scoped.fetchedAt || "") : 0;
+    if (cached.source === "oauth_headers" || !Number.isFinite(scopedAge) || scopedAge < -5000 || scopedAge > CLAUDE_POLL_MS) {
+      scopedLimit = { usedPercent: null, resetsAt: null };
+    }
     return {
       available: true,
       fetchedAt: typeof cached.fetchedAt === "string" ? cached.fetchedAt : null,
@@ -746,7 +802,7 @@ function readClaudeUsageCache({ maxAgeMs }) {
       attemptId: cached.attemptId,
       fiveHour: normalizeClaudeLimit(cached.fiveHour),
       weekAll: normalizeClaudeLimit(cached.weekAll),
-      weekScoped: { ...normalizeClaudeLimit(scoped), label: safeModelLabel(scoped?.label) || (cached.weekSonnet ? "Sonnet" : null) },
+      weekScoped: { ...scopedLimit, label: safeModelLabel(scoped?.label) || (cached.weekSonnet ? "Sonnet" : null) },
     };
   } catch {
     return null;
