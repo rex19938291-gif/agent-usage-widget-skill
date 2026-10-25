@@ -182,11 +182,9 @@ async function summarizeClaude() {
 }
 
 const CLAUDE_POLL_MS = 10 * 60 * 1000;
-// The weekly per-model window (e.g. Fable) only comes from /api/oauth/usage; the
-// messages-header fallback has no such field. While that endpoint is rate limited, the
-// scoped window of the immediately preceding verified oauth/usage success is carried
-// for at most 30 minutes, then it is unknown again.
-const CLAUDE_SCOPED_MAX_MS = 30 * 60 * 1000;
+// The weekly per-model window (e.g. Fable) only comes from a successful
+// /api/oauth/usage answer in the same round; the messages-header fallback has no such
+// field, so on any failure or skip it keeps the label only and the numbers are unknown.
 // A 429 from /api/oauth/usage carries retry-after; obey it (capped) instead of asking
 // again every poll, which only keeps the limiter engaged.
 const CLAUDE_USAGE_RETRY_CAP_MS = 6 * 60 * 60 * 1000;
@@ -200,8 +198,16 @@ function readClaudeLongLivedLogin() {
   } catch { return ""; }
 }
 
+// Server labels are display text only: a bounded plain string, never an object.
+const NEUTRAL_MODEL_LABEL = LANG === "en" ? "Model" : "模型";
+function safeModelLabel(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= 32 ? trimmed : null;
+}
+
 function scopedUnknown(cached) {
-  return { usedPercent: null, resetsAt: null, label: cached?.weekScoped?.label || "Sonnet" };
+  return { usedPercent: null, resetsAt: null, label: safeModelLabel(cached?.weekScoped?.label) || NEUTRAL_MODEL_LABEL };
 }
 
 function normalizeClaudeOfficial(data, cached, source) {
@@ -209,14 +215,12 @@ function normalizeClaudeOfficial(data, cached, source) {
   let scoped = limits?.weekScoped;
   if (!scoped?.label) {
     const key = Object.keys(data || {}).find(key => key.startsWith("seven_day_") && data[key] && typeof data[key] === "object");
-    scoped = key ? { ...normalizeClaudeLimit(data[key]), label: key.slice(10).replace(/^./, c => c.toUpperCase()) } : scopedUnknown(cached);
+    scoped = key ? { ...normalizeClaudeLimit(data[key]), label: safeModelLabel(key.slice(10).replace(/^./, c => c.toUpperCase())) || NEUTRAL_MODEL_LABEL } : scopedUnknown(cached);
   }
   const fiveHour = limits?.fiveHour ?? normalizeClaudeLimit(data?.five_hour);
   const weekAll = limits?.weekAll ?? normalizeClaudeLimit(data?.seven_day);
-  const fetchedAt = new Date().toISOString();
-  if (Number.isFinite(scoped?.usedPercent) && scoped.label) scoped = { ...scoped, fetchedAt };
   return { available: Number.isFinite(fiveHour.usedPercent) || Number.isFinite(weekAll.usedPercent),
-    fetchedAt, source, fiveHour, weekAll, weekScoped: scoped };
+    fetchedAt: new Date().toISOString(), source, fiveHour, weekAll, weekScoped: scoped };
 }
 
 function parseClaudeUsageHeaders(headers, cached) {
@@ -293,24 +297,32 @@ function claudeCliUserAgent() {
 // retry-after is either delta-seconds or an HTTP date. Returns an epoch-ms deadline.
 function parseRetryAfter(value, at = Date.now()) {
   if (typeof value !== "string" || value.trim() === "") return null;
-  const seconds = Number(value.trim());
-  const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - at;
+  const text = value.trim();
+  // Only non-negative integer seconds count as delta-seconds; anything else must be a date.
+  const delay = /^\d+$/.test(text) ? Number(text) * 1000 : Date.parse(text) - at;
   if (!Number.isFinite(delay) || delay <= 0) return null;
   return at + Math.min(delay, CLAUDE_USAGE_RETRY_CAP_MS);
 }
 
-// Only the scoped window of the verified success this attempt replaces may be carried,
-// never one from a rejected or superseded attempt, and never past its own lifetime.
-function carriedClaudeScoped(cached, attempt) {
-  const scoped = cached?.weekScoped;
-  if (claudeCacheRejected || !attempt?.previousSuccessId || cached?.attemptId !== attempt.previousSuccessId) return null;
-  if (!Number.isFinite(scoped?.usedPercent) || !Number.isFinite(scoped?.resetsAt) || isWindowExpired(scoped.resetsAt) || !scoped.label) return null;
-  const age = Date.now() - Date.parse(scoped.fetchedAt || "");
-  if (!Number.isFinite(age) || age < -5000 || age > CLAUDE_SCOPED_MAX_MS) return null;
-  return { usedPercent: scoped.usedPercent, resetsAt: scoped.resetsAt, label: scoped.label, fetchedAt: scoped.fetchedAt };
+// Persist a 429 wait the moment it arrives, under the same ownership rule as results:
+// a crash, a later failure or another process taking over must not shorten it.
+function persistClaudeRetryAt(attempt, retryAt) {
+  if (!Number.isFinite(retryAt)) return;
+  attempt.usageRetryAt = Math.max(retryAt, Number.isFinite(attempt.usageRetryAt) ? attempt.usageRetryAt : 0);
+  for (let i = 0; i < 20; i++) {
+    const result = withClaudePollLock(() => {
+      const current = readClaudePollState();
+      if (current?.attemptId !== attempt.attemptId || current.state !== "in_progress") return { done: true };
+      const keep = Number.isFinite(current.usageRetryAt) ? current.usageRetryAt : 0;
+      try { writeClaudePollState({ ...current, usageRetryAt: Math.max(keep, attempt.usageRetryAt) }); } catch {}
+      return { done: true };
+    });
+    if (!result?.busy) return;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
 }
 
-async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, carryScoped = null } = {}) {
+async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, onRetryAt = () => {} } = {}) {
   const credential = readClaudeLongLivedLogin();
   if (!credential) return { official: null, usageRetryAt };
   const headers = { authorization: `Bearer ${credential}`, "anthropic-beta": "oauth-2025-04-20",
@@ -324,7 +336,10 @@ async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, carrySco
       });
       if (usage.status === 200) official = normalizeClaudeOfficial(await usage.json(), cached, "oauth_usage");
       else {
-        if (usage.status === 429) retryAt = parseRetryAfter(usage.headers?.get?.("retry-after") ?? null);
+        if (usage.status === 429) {
+          retryAt = parseRetryAfter(usage.headers?.get?.("retry-after") ?? null);
+          onRetryAt(retryAt);
+        }
         await usage.body?.cancel();
       }
     } catch { /* The independent messages request must still run. */ }
@@ -337,7 +352,6 @@ async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, carrySco
         body: JSON.stringify({ model: "claude-haiku-4-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
       });
       official = parseClaudeUsageHeaders(response.headers, cached);
-      if (official.available && carryScoped) official.weekScoped = carryScoped;
       await response.body?.cancel().catch(() => {});
     } catch { /* Never expose request context or login material. */ }
   }
@@ -434,13 +448,15 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
   if (!claim.skipLongLived) {
     try {
       const result = await fetchClaudeLongLivedUsage(cached, { usageRetryAt: claim.attempt.usageRetryAt,
-        carryScoped: carriedClaudeScoped(cached, claim.attempt) });
+        onRetryAt: retryAt => persistClaudeRetryAt(claim.attempt, retryAt) });
       official = result.official;
-      if (Number.isFinite(result.usageRetryAt)) claim.attempt.usageRetryAt = result.usageRetryAt;
-      else delete claim.attempt.usageRetryAt;
+      if (!Number.isFinite(result.usageRetryAt) && !(claim.attempt.usageRetryAt > Date.now())) delete claim.attempt.usageRetryAt;
     } catch {}
   }
-  if (!official?.available) {
+  // While the official usage endpoint has asked us to wait, do not turn to the
+  // claude.ai web-login source either.
+  const waiting = Number.isFinite(claim.attempt.usageRetryAt) && claim.attempt.usageRetryAt > Date.now();
+  if (!official?.available && !waiting) {
     try { official = await fetchClaudeCookieUsage(cached); } catch {}
   }
   const finished = finishClaudeAttempt(claim.attempt, official);
@@ -466,7 +482,7 @@ async function fetchCodexOfficialUsage({ force = false } = {}) {
     let response;
     try {
       response = await fetch("https://chatgpt.com/backend-api/codex/usage", {
-        signal: controller.signal,
+        signal: controller.signal, redirect: "manual",
         headers: {
           accept: "application/json",
           authorization: `Bearer ${session.accessToken}`,
@@ -483,11 +499,11 @@ async function fetchCodexOfficialUsage({ force = false } = {}) {
     const official = normalizeCodexUsage(await response.json());
     if (official.available) writeCodexUsageCache(official);
     return { ...official, cache: "live" };
-  } catch (error) {
-    const reason = String(error?.message || error).slice(0, 120);
+  } catch {
+    // Fixed codes only: a raw error message may echo request context.
     const cached = readCodexUsageCache();
-    if (cached) return { ...cached, cache: "stale", error: `live_unavailable:${reason}` };
-    return { available: false, error: `unavailable:${reason}` };
+    if (cached) return { ...cached, cache: "stale", error: "live_unavailable" };
+    return { available: false, error: "unavailable" };
   }
 }
 
@@ -622,12 +638,15 @@ function normalizeClaudeLimitsArray(limits) {
   const toLimit = (entry) => normalizeClaudeLimit(entry ? { utilization: entry.percent, resets_at: entry.resets_at } : null);
   const session = pick("session");
   const weeklyAll = pick("weekly_all");
-  const scoped = pick("weekly_scoped");
+  // Several per-model rows may be listed: take the first one that is usable (a percent
+  // and a future reset), falling back to the first row so its label is still known.
+  const scopedRows = limits.filter((entry) => entry && entry.kind === "weekly_scoped");
+  const scoped = scopedRows.find((entry) => Number.isFinite(toLimit(entry).usedPercent)) || scopedRows[0] || null;
   if (!session && !weeklyAll && !scoped) return null;
   return {
     fiveHour: toLimit(session),
     weekAll: toLimit(weeklyAll),
-    weekScoped: { ...toLimit(scoped), label: scoped?.scope?.model?.display_name || null },
+    weekScoped: { ...toLimit(scoped), label: scoped ? (safeModelLabel(scoped.scope?.model?.display_name) || NEUTRAL_MODEL_LABEL) : null },
   };
 }
 
@@ -668,12 +687,6 @@ function enforceFreshUsage(summary) {
     if (!official) continue;
     for (const key of ["fiveHour", "week", "weekAll", "weekScoped", "weekSonnet"]) {
       if (official[key]) official[key] = { ...official[key], ...normalizeClaudeLimit(official[key]) };
-    }
-    // A carried scoped window keeps its own observation time and lifetime.
-    const scoped = official.weekScoped;
-    if (vendor === "claude" && scoped && "fetchedAt" in scoped) {
-      const age = nowMs - Date.parse(scoped.fetchedAt || "");
-      if (!Number.isFinite(age) || age < -5000 || age > CLAUDE_SCOPED_MAX_MS) official.weekScoped = { ...scoped, usedPercent: null, resetsAt: null };
     }
     if (official.available && !official.error && official.cache !== "stale" && isUsableObservation(official)) continue;
     official.available = false;
@@ -733,8 +746,7 @@ function readClaudeUsageCache({ maxAgeMs }) {
       attemptId: cached.attemptId,
       fiveHour: normalizeClaudeLimit(cached.fiveHour),
       weekAll: normalizeClaudeLimit(cached.weekAll),
-      weekScoped: { ...normalizeClaudeLimit(scoped), label: scoped?.label || (cached.weekSonnet ? "Sonnet" : null),
-        ...(typeof scoped?.fetchedAt === "string" && { fetchedAt: scoped.fetchedAt }) },
+      weekScoped: { ...normalizeClaudeLimit(scoped), label: safeModelLabel(scoped?.label) || (cached.weekSonnet ? "Sonnet" : null) },
     };
   } catch {
     return null;
@@ -929,7 +941,7 @@ function buildText(summary) {
   const claudeFiveRemaining = remainingPercent(c.official?.fiveHour?.usedPercent);
   const claudeWeekRemaining = remainingPercent(c.official?.weekAll?.usedPercent);
   const claudeScopedRemaining = remainingPercent(c.official?.weekScoped?.usedPercent);
-  const scopedLabel = c.official?.weekScoped?.label || "Sonnet";
+  const scopedLabel = safeModelLabel(c.official?.weekScoped?.label) || NEUTRAL_MODEL_LABEL;
   // Codex snapshots only appear when the Codex CLI runs, so they can be hours old while
   // the desktop app shows something quite different. Label the age instead of implying
   // the number is live.
@@ -1503,6 +1515,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var isRefreshing = false
     private var pendingManualRefresh = false
+    private var activeRefreshToken: UUID?
     private var lastCompletedAt: Date?
     // Kept so a language change can re-render the numbers already on screen instead of
     // waiting for the next 60-second refresh.
@@ -1815,6 +1828,8 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             return
         }
         isRefreshing = true
+        let token = UUID()
+        activeRefreshToken = token
         setStatus(Strings.current.updating)
         refreshButton.alphaValue = 0.4
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -1833,37 +1848,71 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             process.standardOutput = pipe
             // An unread stderr pipe can fill and block the child forever; discard it.
             process.standardError = FileHandle.nullDevice
+            // Output is collected on the file handle's own queue, so a child writing more
+            // than the pipe buffer never blocks against our wait for its exit.
+            let reader = pipe.fileHandleForReading
+            let outputLock = NSLock()
+            var output = Data()
+            let reachedEnd = DispatchSemaphore(value: 0)
+            reader.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                    reachedEnd.signal()
+                } else {
+                    outputLock.lock(); output.append(chunk); outputLock.unlock()
+                }
+            }
+            let exited = DispatchGroup()
+            exited.enter()
+            process.terminationHandler = { _ in exited.leave() }
             do {
                 try process.run()
-                // A hung child must not leave "Updating…" on screen: terminate it after
-                // 45 seconds (its own network requests time out after 8 seconds each),
-                // which ends in the failure branch below and still runs finishRefresh.
-                let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
-                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 45, execute: watchdog)
-                // Drain stdout before waiting, so output larger than the pipe buffer
-                // cannot deadlock the child against waitUntilExit.
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                watchdog.cancel()
-                DispatchQueue.main.async {
-                    if process.terminationStatus == 0, let summary = try? JSONDecoder().decode(UsageSummary.self, from: data) {
-                        self.lastCompletedAt = Date()
-                        self.updateUI(summary)
-                    } else {
-                        self.setStatus(Strings.current.updateFailed)
-                    }
-                    self.finishRefresh()
-                }
             } catch {
+                reader.readabilityHandler = nil
+                try? reader.close()
                 DispatchQueue.main.async {
                     self.setStatus(Strings.current.updateFailed)
-                    self.finishRefresh()
+                    self.finishRefresh(token)
                 }
+                return
+            }
+            // A hung child must not leave "Updating…" on screen. Its own requests time
+            // out after 8 seconds each, so 45 seconds means it is stuck: ask it to stop,
+            // and if it ignores that for 5 seconds, kill it outright.
+            var timedOut = false
+            if exited.wait(timeout: .now() + 45) == .timedOut {
+                timedOut = true
+                process.terminate()
+                if exited.wait(timeout: .now() + 5) == .timedOut {
+                    kill(process.processIdentifier, SIGKILL)
+                    _ = exited.wait(timeout: .now() + 5)
+                }
+            }
+            // A descendant that inherited the pipe can keep it open after the child exits.
+            // Give a normal exit 2 seconds to deliver the rest, then close our end anyway.
+            if reachedEnd.wait(timeout: .now() + (timedOut ? 0 : 2)) == .timedOut {
+                reader.readabilityHandler = nil
+                try? reader.close()
+            }
+            outputLock.lock(); let data = output; outputLock.unlock()
+            let succeeded = !timedOut && !process.isRunning && process.terminationStatus == 0
+            DispatchQueue.main.async {
+                if succeeded, let summary = try? JSONDecoder().decode(UsageSummary.self, from: data) {
+                    self.lastCompletedAt = Date()
+                    self.updateUI(summary)
+                } else {
+                    self.setStatus(Strings.current.updateFailed)
+                }
+                self.finishRefresh(token)
             }
         }
     }
 
-    private func finishRefresh() {
+    // Runs at most once per refresh: only the token of the refresh in flight counts.
+    private func finishRefresh(_ token: UUID) {
+        guard token == activeRefreshToken else { return }
+        activeRefreshToken = nil
         isRefreshing = false
         refreshButton.alphaValue = 1
         if pendingManualRefresh {
