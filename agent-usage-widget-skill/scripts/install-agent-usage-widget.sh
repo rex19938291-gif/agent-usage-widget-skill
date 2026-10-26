@@ -1767,6 +1767,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             return
         }
         buildPanel()
+        // A display added, removed or rearranged moves the visible frame: re-anchor.
+        NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
         refresh(forceClaude: true)
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh(forceClaude: true) }
     }
@@ -1901,6 +1904,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         Metrics.codexRowCount = rows
         let top = panel.frame.maxY
         panel.setFrame(NSRect(x: panel.frame.minX, y: top - Metrics.height, width: Metrics.width, height: Metrics.height), display: false)
+        // Re-anchor to the corner after every height change; keeping only the old top
+        // edge drifted the panel away from the menu bar.
+        positionTopLeft()
         visual.frame = NSRect(x: 0, y: 0, width: Metrics.width, height: Metrics.height)
         titleLabel.frame.origin.y = Metrics.codexTitleY
         percentHeader.frame.origin.y = Metrics.colHeaderY
@@ -1964,6 +1970,12 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     func runRowToggleCheck() -> [String] {
         buildPanel(show: false)
         var problems: [String] = []
+        // After every four/five-row switch the panel must still sit 18 points inside the
+        // top-left corner of the visible frame.
+        func anchored() -> Bool {
+            guard let visible = NSScreen.main?.visibleFrame else { return true }
+            return abs(panel.frame.maxY - (visible.maxY - 18)) < 0.5 && abs(panel.frame.minX - (visible.minX + 18)) < 0.5
+        }
         func expect(_ step: String, rows: Int, percent: String? = nil, reset: String? = nil,
                     allUnknown: Bool = false, claudeFive: String? = nil, fiveLabel: String? = nil) {
             let hidden = codexFiveLabel.isHidden
@@ -1975,11 +1987,13 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
                 && (fiveLabel == nil || codexFiveLabel.stringValue == fiveLabel) && hidden == (rows == 1)
                 && codexFivePercent.isHidden == hidden && codexFiveReset.isHidden == hidden
                 && panel.frame.height == Metrics.height
+                && anchored()
                 && (percent == nil || codexFivePercent.stringValue == percent)
                 && (reset == nil || codexFiveReset.stringValue == reset)
-            print(String(format: "%-40s rows=%d hidden=%@ percent=%@ reset=%@ height=%.0f  %@",
+            print(String(format: "%-40s rows=%d hidden=%@ percent=%@ reset=%@ height=%.0f minX=%.0f maxY=%.0f  %@",
                          (step as NSString).utf8String!, Metrics.codexRowCount, hidden ? "yes" : "no",
-                         codexFivePercent.stringValue, codexFiveReset.stringValue, panel.frame.height, ok ? "ok" : "PROBLEM"))
+                         codexFivePercent.stringValue, codexFiveReset.stringValue, panel.frame.height,
+                         panel.frame.minX, panel.frame.maxY, ok ? "ok" : "PROBLEM"))
             if !ok { problems.append(step) }
         }
         let now = ISO8601DateFormatter().string(from: Date())
@@ -2025,6 +2039,10 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         Strings.checkOverride = nil
         if panel.frame.maxY != topBefore { problems.append("top edge moved after restoring") }
         return problems
+    }
+
+    @objc private func screenParametersChanged() {
+        positionTopLeft()
     }
 
     private func positionTopLeft() {
