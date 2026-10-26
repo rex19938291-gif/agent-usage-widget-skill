@@ -198,6 +198,77 @@ function readClaudeLongLivedLogin() {
   } catch { return ""; }
 }
 
+// The Claude Code CLI login (Keychain "Claude Code-credentials"). Long-lived
+// setup-token logins lack the user:profile scope that /api/oauth/usage requires, so the
+// per-model weekly window can only be read with this one. Held in memory only; never
+// refreshed, written back, cached or printed here.
+function readClaudeCliLogin() {
+  const empty = { accessToken: "", expiresAt: null, hasProfileScope: false, hasRefresh: false };
+  try {
+    const raw = execFileSync("/usr/bin/security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const login = JSON.parse(raw)?.claudeAiOauth;
+    if (!login || typeof login !== "object") return empty;
+    const expiresAt = Number(login.expiresAt);
+    return {
+      accessToken: typeof login.accessToken === "string" ? login.accessToken : "",
+      expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : null,
+      hasProfileScope: Array.isArray(login.scopes) && login.scopes.includes("user:profile"),
+      hasRefresh: typeof login.refreshToken === "string" && login.refreshToken.length > 0,
+    };
+  } catch { return empty; }
+}
+
+function claudeCliLoginUsable(login) {
+  return Boolean(login?.accessToken) && Number.isFinite(login.expiresAt) && login.expiresAt - 30000 > Date.now();
+}
+
+// The CLI renews its own login on its next API request, under its own cross-process
+// lock, and writes it back to the Keychain. The widget only asks it to run once; it
+// never touches the refresh value itself (that would bypass the CLI's lock).
+const CLAUDE_CLI_RENEW_STATE = path.join(CACHE_DIR, "claude-cli-renew.json");
+const CLAUDE_CLI_RENEW_COOLDOWN_MS = 10 * 60 * 1000;
+let CLAUDE_CLI_RENEW_TIMEOUT_MS = 60 * 1000;
+const CLAUDE_CLI_RENEW_ARGS = ["-p", "ok", "--model", "haiku", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+  "--setting-sources", "local", "--disable-slash-commands", "--no-session-persistence"];
+
+function resolveClaudeCliPath() {
+  const usable = file => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
+  try {
+    const recorded = fs.readFileSync(path.join(INSTALL_DIR, "claude-path"), "utf8").trim();
+    if (path.isAbsolute(recorded) && usable(recorded)) return recorded;
+  } catch {}
+  // The recorded version directory disappears after a CLI self-update; follow the link again.
+  try {
+    const linked = fs.realpathSync(path.join(HOME, ".local/bin/claude"));
+    if (usable(linked)) return linked;
+  } catch {}
+  return null;
+}
+
+function renewClaudeCliLogin(login) {
+  if (!MANUAL_REFRESH || claudeCliLoginUsable(login) || !login?.hasRefresh) return false;
+  let last = 0;
+  try { last = Number(JSON.parse(fs.readFileSync(CLAUDE_CLI_RENEW_STATE, "utf8"))?.lastAttemptAt) || 0; } catch {}
+  // A record from the "future" (clock moved back) also counts as recent.
+  if (Math.abs(Date.now() - last) < CLAUDE_CLI_RENEW_COOLDOWN_MS) return false;
+  const cli = resolveClaudeCliPath();
+  if (!cli) return false;
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(CLAUDE_CLI_RENEW_STATE, JSON.stringify({ lastAttemptAt: Date.now() }), { mode: 0o600 });
+  } catch { return false; } // Without a cooldown record, do not risk repeated runs.
+  // Minimal environment, built from scratch: the long-lived token and any API key are
+  // never passed, so the CLI uses its own Keychain login.
+  const env = { HOME, PATH: "/usr/bin:/bin" };
+  for (const key of ["USER", "LOGNAME", "TMPDIR"]) if (process.env[key]) env[key] = process.env[key];
+  try {
+    execFileSync(cli, CLAUDE_CLI_RENEW_ARGS, { env, cwd: INSTALL_DIR, timeout: CLAUDE_CLI_RENEW_TIMEOUT_MS,
+      stdio: "ignore", killSignal: "SIGKILL" });
+    return true;
+  } catch { return false; }
+}
+
 // Server labels are display text only: a bounded plain string, never an object.
 const NEUTRAL_MODEL_LABEL = LANG === "en" ? "Model" : "模型";
 function safeModelLabel(value) {
@@ -368,44 +439,57 @@ class ClaudeRetryPersistError extends Error {}
 
 async function fetchClaudeLongLivedUsage(cached, { usageRetryAt = null, skipUsage = false, onRetryAt = () => {} } = {}) {
   const credential = readClaudeLongLivedLogin();
-  if (!credential) return { official: null, usageRetryAt };
-  const headers = { authorization: `Bearer ${credential}`, "anthropic-beta": "oauth-2025-04-20",
-    "user-agent": claudeCliUserAgent() };
+  const userAgent = claudeCliUserAgent();
   let official;
+  let usageError = null;
   let retryAt = Number.isFinite(usageRetryAt) && usageRetryAt > Date.now() ? usageRetryAt : null;
   if (!retryAt && !skipUsage) {
-    try {
-      const usage = await fetch("https://api.anthropic.com/api/oauth/usage", {
-        headers: { ...headers, "content-type": "application/json" }, redirect: "error", signal: AbortSignal.timeout(8000),
-      });
-      if (usage.status === 200) official = normalizeClaudeOfficial(await usage.json(), cached, "oauth_usage");
-      else {
-        if (usage.status === 429) {
-          retryAt = parseRetryAfter(usage.headers?.get?.("retry-after") ?? null);
-          if (onRetryAt(retryAt) === false) {
-            await usage.body?.cancel?.().catch?.(() => {});
-            throw new ClaudeRetryPersistError();
+    // /api/oauth/usage needs the CLI login (user:profile); the long-lived one is refused.
+    let login = readClaudeCliLogin();
+    if (!claudeCliLoginUsable(login) && renewClaudeCliLogin(login)) login = readClaudeCliLogin();
+    if (!login.accessToken) usageError = "cli_login_missing";
+    else if (!claudeCliLoginUsable(login)) usageError = "cli_login_expired";
+    else if (!login.hasProfileScope) usageError = "usage_scope_missing";
+    else {
+      try {
+        const usage = await fetch("https://api.anthropic.com/api/oauth/usage", {
+          headers: { authorization: `Bearer ${login.accessToken}`, "anthropic-beta": "oauth-2025-04-20",
+            "user-agent": userAgent, "content-type": "application/json" },
+          redirect: "error", signal: AbortSignal.timeout(8000),
+        });
+        if (usage.status === 200) official = normalizeClaudeOfficial(await usage.json(), cached, "oauth_usage");
+        else {
+          if (usage.status === 429) {
+            retryAt = parseRetryAfter(usage.headers?.get?.("retry-after") ?? null);
+            if (onRetryAt(retryAt) === false) {
+              await usage.body?.cancel?.().catch?.(() => {});
+              throw new ClaudeRetryPersistError();
+            }
           }
+          // A fixed code only; the response body is never kept.
+          usageError = usage.status === 403 ? "usage_scope_missing" : `usage_http_${Number(usage.status) || 0}`;
+          await usage.body?.cancel?.().catch?.(() => {});
         }
-        await usage.body?.cancel();
+      } catch (error) {
+        if (error instanceof ClaudeRetryPersistError) throw error;
+        usageError ||= "usage_unavailable";
+        /* Otherwise the independent messages request must still run. */
       }
-    } catch (error) {
-      if (error instanceof ClaudeRetryPersistError) throw error;
-      /* Otherwise the independent messages request must still run. */
     }
   }
-  if (!official?.available) {
+  if (!official?.available && credential) {
     try {
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST", redirect: "error", signal: AbortSignal.timeout(8000),
-        headers: { ...headers, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+        headers: { authorization: `Bearer ${credential}`, "anthropic-beta": "oauth-2025-04-20", "user-agent": userAgent,
+          "anthropic-version": "2023-06-01", "content-type": "application/json" },
         body: JSON.stringify({ model: "claude-haiku-4-5", max_tokens: 1, messages: [{ role: "user", content: "hi" }] }),
       });
       official = parseClaudeUsageHeaders(response.headers, cached);
       await response.body?.cancel().catch(() => {});
     } catch { /* Never expose request context or login material. */ }
   }
-  return { official: official?.available ? official : null, usageRetryAt: retryAt };
+  return { official: official?.available ? official : null, usageRetryAt: retryAt, usageError };
 }
 
 async function fetchClaudeCookieUsage(cached) {
@@ -509,6 +593,7 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
         skipUsage: claim.attempt.waitUnknown === true,
         onRetryAt: retryAt => persistClaudeRetryAt(claim.attempt, retryAt) });
       official = result.official;
+      if (result.usageError) claim.attempt.usageError = result.usageError;
       if (!Number.isFinite(result.usageRetryAt) && !(claim.attempt.usageRetryAt > Date.now())) delete claim.attempt.usageRetryAt;
     } catch (error) {
       if (error instanceof ClaudeRetryPersistError) {
@@ -1152,6 +1237,22 @@ fi
 # from PATH, where they would pick up a build the usage endpoint rejects.
 printf '%s\n' "$NODE_BIN" > "$INSTALL_DIR/node-path"
 chmod 600 "$INSTALL_DIR/node-path"
+
+# The Claude Code CLI, used only by a manual refresh to let the CLI renew its own
+# expired login. Prefer the resolved target of ~/.local/bin/claude; without one the
+# widget simply skips renewal.
+CLAUDE_BIN=""
+for candidate in "$HOME/.local/bin/claude" "$(command -v claude 2>/dev/null || true)"; do
+  [[ -n "$candidate" && -e "$candidate" ]] || continue
+  resolved="$(/bin/realpath "$candidate" 2>/dev/null || true)"
+  if [[ -n "$resolved" && -x "$resolved" ]]; then CLAUDE_BIN="$resolved"; break; fi
+done
+if [[ -n "$CLAUDE_BIN" ]]; then
+  printf '%s\n' "$CLAUDE_BIN" > "$INSTALL_DIR/claude-path"
+  chmod 600 "$INSTALL_DIR/claude-path"
+else
+  rm -f "$INSTALL_DIR/claude-path"
+fi
 
 echo "Using node: $NODE_BIN ($("$NODE_BIN" --version 2>/dev/null || echo unknown))"
 if [[ "$NODE_UNTESTED" == "1" ]]; then
@@ -2127,9 +2228,10 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             }
             // A hung child must not leave "Updating…" on screen. Its own requests time
             // out after 8 seconds each, so 45 seconds means it is stuck: ask it to stop,
-            // and if it ignores that for 5 seconds, kill it outright.
+            // and if it ignores that for 5 seconds, kill it outright. A manual refresh may
+            // first let the Claude CLI renew its login (up to 60 seconds), so it gets 100.
             var timedOut = false
-            if exited.wait(timeout: .now() + 45) == .timedOut {
+            if exited.wait(timeout: .now() + (manual ? 100 : 45)) == .timedOut {
                 timedOut = true
                 process.terminate()
                 if exited.wait(timeout: .now() + 5) == .timedOut {

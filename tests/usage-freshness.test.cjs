@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 const installer = fs.readFileSync(path.join(__dirname, '../agent-usage-widget-skill/scripts/install-agent-usage-widget.sh'), 'utf8');
+// 機器很忙時可用 USAGE_TEST_TIMEOUT_MS 放寬每次執行的逾時（預設 5 秒）。
+const RUN_TIMEOUT = Number(process.env.USAGE_TEST_TIMEOUT_MS) || 5000;
 const source = installer.split("<<'NODE'\n")[1].split('\nNODE\n')[0];
 function fixture(t, age = 0, expired = false) {
   const tmpRoot = path.join(__dirname, '../.test-tmp');
@@ -16,6 +18,10 @@ function fixture(t, age = 0, expired = false) {
   const mock = (injection = '') => fs.writeFileSync(script, source.replace('main().catch(', `
 readClaudeLongLivedLogin = () => "";
 readClaudeDesktopSession = () => ({});
+// 離線測試絕不讀真的鑰匙圈：預設把 CLI 登入視為與長效登入同一組假權杖、未過期、有 user:profile。
+readClaudeCliLogin = () => { const token = readClaudeLongLivedLogin(); return token ? {accessToken: token, expiresAt: Date.now() + 3600000, hasProfileScope: true, hasRefresh: true} : {accessToken: "", expiresAt: null, hasProfileScope: false, hasRefresh: false}; };
+const realResolveClaudeCliPath = resolveClaudeCliPath;
+resolveClaudeCliPath = () => null;
 fetch = async () => { throw new Error("offline test forbids unexpected network"); };
 ${injection}
 main().catch(`));
@@ -28,7 +34,7 @@ main().catch(`));
     for (const [vendor, data] of Object.entries({claude,codex})) fs.writeFileSync(path.join(install, '.cache', vendor+'-usage-percentages.json'), JSON.stringify(data));
     fs.writeFileSync(path.join(install,'.cache/claude-oauth-poll.json'),JSON.stringify({attemptId:claude.attemptId,state:'succeeded',startedAt:Date.now()-601000}));
   };
-  const run = (...args) => execFileSync(process.execPath, [script, '--quota-only', ...args], {env:{HOME:home,PATH:'/usr/bin:/bin'}, encoding:'utf8', timeout:5000});
+  const run = (...args) => execFileSync(process.execPath, [script, '--quota-only', ...args], {env:{HOME:home,PATH:'/usr/bin:/bin'}, encoding:'utf8', timeout:RUN_TIMEOUT});
   save(); return {claude, codex, save, run, script, home, install, mock};
 }
 test('fresh exhausted Claude session is 0% remaining, not 100%', t => {
@@ -612,7 +618,7 @@ global.Date = class extends RealDate { constructor(...a) { super(...(a.length ? 
   const body = fs.readFileSync(f.script, 'utf8');
   const shebang = body.startsWith('#!') ? body.slice(0, body.indexOf('\n') + 1) : '';
   fs.writeFileSync(timed, shebang + prefix + body.slice(shebang.length));
-  return execFileSync(process.execPath, [timed, '--quota-only', ...args], {env: {HOME: f.home, PATH: '/usr/bin:/bin', FAKE_NOW: String(at)}, encoding: 'utf8', timeout: 5000});
+  return execFileSync(process.execPath, [timed, '--quota-only', ...args], {env: {HOME: f.home, PATH: '/usr/bin:/bin', FAKE_NOW: String(at)}, encoding: 'utf8', timeout: RUN_TIMEOUT});
 }
 const failureMocks = {
   401: f => scopedMock(f, {usageStatus: 401}),
@@ -864,4 +870,127 @@ main = async () => { process.stdout.write(JSON.stringify(await fetchCodexOfficia
   assert.equal(fs.readFileSync(path.join(f.home, 'codex-redirect'), 'utf8'), 'manual');
   assert.doesNotMatch(out, /fake-secret-token|fake-account-id|boom/);
   assert.match(out, /"error":"(unavailable|live_unavailable)"/);
+});
+
+// CLI 登入（鑰匙圈）查 Fable 與手動重新整理時讓 CLI 自己續期（2026-10-26）。全離線：假鑰匙圈檔＋假 CLI 腳本。
+function cliFixture(t, {expired = true, hasRefresh = true, profile = true, cli = 'renew'} = {}) {
+  const f = fixture(t);
+  const keychain = path.join(f.home, 'fake-keychain.json');
+  const login = (fresh) => ({accessToken: fresh ? 'fake-cli-fresh-token' : 'fake-cli-old-token', expiresAt: fresh ? Date.now() + 3600000 : Date.now() - 60000,
+    scopes: profile ? ['user:inference', 'user:profile'] : ['user:inference'], refreshToken: hasRefresh ? 'fake-refresh-secret' : ''});
+  fs.writeFileSync(keychain, JSON.stringify(login(!expired)));
+  const script = path.join(f.home, 'fake-claude');
+  const fresh = JSON.stringify(login(true)).replace(/'/g, "'\\''");
+  const body = {
+    renew: `#!/bin/sh\nenv > "$HOME/cli-env.txt"\npwd > "$HOME/cli-cwd.txt"\necho "$@" > "$HOME/cli-args.txt"\necho run >> "$HOME/cli-runs.txt"\nprintf '%s' '${fresh}' > "$HOME/fake-keychain.json"\necho 'fake-refresh-secret fake-cli-fresh-token' \n`,
+    hang: `#!/bin/sh\necho run >> "$HOME/cli-runs.txt"\nexec /bin/sleep 30\n`,
+  }[cli];
+  fs.writeFileSync(script, body, {mode: 0o755});
+  fs.writeFileSync(path.join(f.install, 'claude-path'), script + '\n');
+  f.cliMock = (extra = '') => f.mock(`readClaudeLongLivedLogin = () => "dummy-long-lived";
+resolveClaudeCliPath = realResolveClaudeCliPath;
+CLAUDE_CLI_RENEW_TIMEOUT_MS = ${cli === 'hang' ? 3000 : 30000};
+readClaudeCliLogin = () => {
+  try { const o = JSON.parse(fs.readFileSync(path.join(HOME, 'fake-keychain.json'), 'utf8'));
+    return {accessToken: o.accessToken, expiresAt: o.expiresAt, hasProfileScope: o.scopes.includes('user:profile'), hasRefresh: !!o.refreshToken};
+  } catch { return {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false}; }
+};
+${extra}
+fetch = async (url, options) => {
+  const name = url.endsWith('/api/oauth/usage') ? 'usage' : 'messages';
+  fs.appendFileSync(path.join(HOME, name + '-auth.txt'), options.headers.authorization + '\\n');
+  if (name === 'usage') return {status: 200, json: async () => (${JSON.stringify(limitsBody())})};
+  return {status: 200, headers: new Headers(${JSON.stringify(headersAt())})};
+};`);
+  f.cliMock();
+  f.runs = () => fs.existsSync(path.join(f.home, 'cli-runs.txt')) ? fs.readFileSync(path.join(f.home, 'cli-runs.txt'), 'utf8').trim().split('\n').length : 0;
+  f.lines = name => fs.existsSync(path.join(f.home, name)) ? fs.readFileSync(path.join(f.home, name), 'utf8').trim().split('\n') : [];
+  return f;
+}
+test('CLI 登入: 過期時手動重新整理叫 CLI 續期，再讀鑰匙圈後官方用量成功、Fable 有數字', t => {
+  const f = cliFixture(t);
+  const data = JSON.parse(f.run('--refresh', '--manual'));
+  assert.equal(f.runs(), 1);
+  assert.equal(data.claude.official.source, 'oauth_usage');
+  assert.equal(data.claude.official.weekScoped.usedPercent, 25);
+  assert.equal(data.claude.official.weekScoped.label, 'Fable');
+  assert.deepEqual(f.lines('usage-auth.txt'), ['Bearer fake-cli-fresh-token']);
+  assert.deepEqual(f.lines('messages-auth.txt'), []);
+});
+test('CLI 登入: CLI 卡住超過逾時被結束，Fable 維持未知、5 小時與每週仍由標頭提供', t => {
+  const f = cliFixture(t, {cli: 'hang'});
+  const started = Date.now();
+  const data = JSON.parse(f.run('--refresh', '--manual'));
+  assert.ok(Date.now() - started < 25000); // 假 CLI 會睡 30 秒，代表已被逾時結束
+  assert.equal(f.runs(), 1);
+  assert.equal(data.claude.official.source, 'oauth_headers');
+  assert.equal(data.claude.official.fiveHour.usedPercent, 39);
+  assert.equal(data.claude.official.weekScoped.usedPercent, null);
+  assert.deepEqual(f.lines('usage-auth.txt'), []);
+  assert.deepEqual(f.lines('messages-auth.txt'), ['Bearer dummy-long-lived']);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'))).usageError, 'cli_login_expired');
+});
+test('CLI 登入: 權杖未過期時不叫 CLI，直接用鑰匙圈登入查官方用量', t => {
+  const f = cliFixture(t, {expired: false});
+  const data = JSON.parse(f.run('--refresh', '--manual'));
+  assert.equal(f.runs(), 0);
+  assert.equal(data.claude.official.weekScoped.usedPercent, 25);
+  assert.deepEqual(f.lines('usage-auth.txt'), ['Bearer fake-cli-fresh-token']);
+});
+test('CLI 登入: 非手動重新整理即使過期也不叫 CLI', t => {
+  const f = cliFixture(t);
+  const data = JSON.parse(f.run('--refresh'));
+  assert.equal(f.runs(), 0);
+  assert.equal(data.claude.official.weekScoped.usedPercent, null);
+  assert.equal(data.claude.official.fiveHour.usedPercent, 39);
+});
+test('CLI 登入: 10 分鐘冷卻內連按只叫一次 CLI', t => {
+  const f = cliFixture(t, {cli: 'hang'});
+  f.run('--refresh', '--manual');
+  const statePath = path.join(f.install, '.cache/claude-oauth-poll.json');
+  const s = JSON.parse(fs.readFileSync(statePath)); s.startedAt = s.longLivedStartedAt = Date.now() - 61000; fs.writeFileSync(statePath, JSON.stringify(s));
+  f.run('--refresh', '--manual');
+  assert.equal(f.runs(), 1);
+  const renew = path.join(f.install, '.cache/claude-cli-renew.json');
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(renew))), ['lastAttemptAt']);
+  fs.writeFileSync(renew, JSON.stringify({lastAttemptAt: Date.now() - 601000}));
+  const s2 = JSON.parse(fs.readFileSync(statePath)); s2.startedAt = s2.longLivedStartedAt = Date.now() - 61000; fs.writeFileSync(statePath, JSON.stringify(s2));
+  f.run('--refresh', '--manual');
+  assert.equal(f.runs(), 2);
+});
+for (const [name, opts, code] of [['沒有更新值', {hasRefresh: false}, 'cli_login_expired'], ['缺 user:profile', {expired: false, profile: false}, 'usage_scope_missing']]) {
+  test(`CLI 登入: ${name}時不叫 CLI、不查官方用量`, t => {
+    const f = cliFixture(t, opts);
+    const data = JSON.parse(f.run('--refresh', '--manual'));
+    assert.equal(f.runs(), 0);
+    assert.deepEqual(f.lines('usage-auth.txt'), []);
+    assert.equal(data.claude.official.weekScoped.usedPercent, null);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'))).usageError, code);
+  });
+}
+test('CLI 登入: 子程序環境不帶長效權杖與 API 金鑰，工作目錄是安裝資料夾，參數不載 MCP', t => {
+  const f = cliFixture(t);
+  execFileSync(process.execPath, [f.script, '--quota-only', '--refresh', '--manual'], {encoding: 'utf8', timeout: RUN_TIMEOUT,
+    env: {HOME: f.home, PATH: '/usr/bin:/bin', CLAUDE_CODE_OAUTH_TOKEN: 'parent-long-lived-secret', ANTHROPIC_API_KEY: 'parent-api-key'}});
+  const env = fs.readFileSync(path.join(f.home, 'cli-env.txt'), 'utf8');
+  assert.doesNotMatch(env, /CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|parent-/);
+  assert.match(env, /^PATH=\/usr\/bin:\/bin$/m);
+  assert.equal(fs.realpathSync(fs.readFileSync(path.join(f.home, 'cli-cwd.txt'), 'utf8').trim()), fs.realpathSync(f.install));
+  assert.match(fs.readFileSync(path.join(f.home, 'cli-args.txt'), 'utf8'), /^-p ok --model haiku --strict-mcp-config --mcp-config \{"mcpServers":\{\}\} --setting-sources local/);
+});
+test('CLI 登入: 假權杖、假更新值不出現在輸出與任何保存檔', t => {
+  const f = cliFixture(t);
+  const out = f.run('--refresh', '--manual') + f.run('--text') + f.run('--refresh', '--manual', '--text');
+  assert.doesNotMatch(out, /fake-cli|fake-refresh|dummy-long-lived/);
+  const walk = dir => fs.readdirSync(dir, {withFileTypes: true}).flatMap(e => e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]);
+  for (const file of walk(path.join(f.install, '.cache'))) assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /fake-cli|fake-refresh|dummy-long-lived/, file);
+});
+test('CLI 登入: 讀鑰匙圈失敗時不影響標頭來源', t => {
+  const f = cliFixture(t);
+  f.cliMock(`readClaudeCliLogin = () => ({accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false});`);
+  const data = JSON.parse(f.run('--refresh', '--manual'));
+  assert.equal(f.runs(), 0);
+  assert.equal(data.claude.official.fiveHour.usedPercent, 39);
+  assert.equal(data.claude.official.weekScoped.usedPercent, null);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'))).usageError, 'cli_login_missing');
 });
