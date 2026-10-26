@@ -184,7 +184,20 @@ LaunchAgent label but points it at `/Applications`.
 
 Both services prefer official observations and retain bounded local fallbacks.
 
-- Codex: `https://chatgpt.com/backend-api/codex/usage`, using the existing local login.
+- Codex (primary): the Codex CLI's own `codex app-server` over stdio JSON-RPC
+  (`initialize`, then `account/rateLimits/read`). The installer records the CLI location
+  (launchd's PATH has none); without it the report says `codex_cli_missing`. The child runs
+  with a minimal environment in a fresh empty directory, stderr discarded, its whole process
+  group killed after the answer or after 15 seconds. Unrelated notification lines are
+  ignored; only the replies to our request ids count. Windows are classified by
+  `windowDurationMins` (300 = 5 hours, 10080 = 1 week), never by slot. Only percentages and
+  reset/observation times are cached, never the raw reply.
+- Codex polling: background refreshes ask the app-server at most once per ten minutes,
+  failures included, and reuse an app-server observation younger than ten minutes; the
+  refresh button may ask again after 60 seconds. A failed attempt never revives an older
+  number; the report falls through to the next source.
+- Codex second source: `https://chatgpt.com/backend-api/codex/usage` with the existing
+  local login, kept as a backup only.
 - Codex fallback: enumerate `rollout-*.jsonl` metadata throughout the session tree,
   retaining the five newest files modified within two days, including resumed conversations
   created on older dates. Above 5000 files, restrict metadata lookup to the last 30 calendar
@@ -331,7 +344,8 @@ menu, or `pkill -x AgentUsageWidget`.
 Never infer a full quota when a cached reset time passes. Usage in the new window is
 unknown until another observation arrives. A newly generated report cannot renew an
 observation. Ordinary official/cache observations expire after three minutes; Claude
-long-lived observations stay usable for ten minutes to match polling. Codex recorded
+long-lived observations and Codex app-server observations stay usable for ten minutes
+to match polling. Codex recorded
 observations may be up to two days old, must name the observation time, and require an
 unexpired reset for each displayed window. Reject invalid times or times more than
 five seconds in the future. Apply the same source-specific lifetime in JavaScript and Swift.

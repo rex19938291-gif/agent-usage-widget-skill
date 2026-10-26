@@ -18,7 +18,7 @@ const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 const crypto = require("crypto");
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 
 const HOME = process.env.HOME;
 const INSTALL_DIR = process.env.AGENT_USAGE_WIDGET_DIR || path.join(HOME, ".agent-usage-widget");
@@ -630,9 +630,8 @@ async function fetchClaudeOfficialUsage({ force = false } = {}) {
   return finished && !finished.busy ? finished : unknown(official?.error || "live_unavailable");
 }
 
-// Live Codex quota. The local session logs only get written while the Codex CLI runs — the
-// desktop app keeps its rate limits in memory — so log-derived numbers can be a day stale
-// and disagree with the app. This is the same endpoint the app itself reads.
+// Fallback Codex quota (second source, after the app-server). The local session logs only
+// get written while the Codex CLI runs, so log-derived numbers can be a day stale.
 async function fetchCodexOfficialUsage({ force = false } = {}) {
   if (!force) {
     const cached = readCodexUsageCache();
@@ -672,6 +671,160 @@ async function fetchCodexOfficialUsage({ force = false } = {}) {
     if (cached) return { ...cached, cache: "stale", error: "live_unavailable" };
     return { available: false, error: "unavailable" };
   }
+}
+
+// Primary Codex source: the Codex CLI's own app-server (JSON-RPC, one message per line on
+// stdio), the same channel the Codex apps use to read rate limits. Only percentages and
+// times leave this function; the raw response is never stored or printed.
+const CODEX_APP_SERVER_POLL_MS = 10 * 60 * 1000;
+const CODEX_APP_SERVER_MANUAL_MS = 60 * 1000;
+let CODEX_APP_SERVER_TIMEOUT_MS = 15 * 1000;
+const CODEX_APP_SERVER_STATE = path.join(CACHE_DIR, "codex-app-server-poll.json");
+const CODEX_APP_SERVER_MAX_OUTPUT = 4 * 1024 * 1024;
+
+let CODEX_CLI_CANDIDATES = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", path.join(HOME, ".local/bin/codex")];
+function resolveCodexCliPath() {
+  const usable = file => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
+  try {
+    const recorded = fs.readFileSync(path.join(INSTALL_DIR, "codex-path"), "utf8").trim();
+    if (path.isAbsolute(recorded) && usable(recorded)) return recorded;
+  } catch {}
+  // launchd's PATH has no codex; try the usual install locations instead.
+  for (const candidate of CODEX_CLI_CANDIDATES) {
+    if (usable(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Windows are classified by their length, never by slot: a weekly-only plan reports the
+// weekly window as primary and secondary as null.
+function normalizeCodexAppServerLimits(rateLimits) {
+  let fiveHour = null;
+  let week = null;
+  for (const window of [rateLimits?.primary, rateLimits?.secondary]) {
+    if (!window || typeof window !== "object") continue;
+    const used = Number(window.usedPercent);
+    const minutes = Number(window.windowDurationMins);
+    if (typeof window.usedPercent !== "number" || !Number.isFinite(used) || used < 0 || used > 100) continue;
+    if (!Number.isFinite(minutes) || minutes <= 0) continue;
+    const entry = { usedPercent: used, resetsAt: finiteOrNull(window.resetsAt) };
+    if (minutes <= 360) fiveHour = entry;
+    else if (minutes >= 4320) week = entry;
+  }
+  return { available: Boolean(fiveHour || week), source: "app_server", fetchedAt: new Date().toISOString(), fiveHour, week };
+}
+
+function readCodexAppServerState() {
+  try { return Number(JSON.parse(fs.readFileSync(CODEX_APP_SERVER_STATE, "utf8"))?.lastAttemptAt) || 0; } catch { return 0; }
+}
+
+function runCodexAppServer(cli) {
+  return new Promise(resolve => {
+    const env = { HOME, PATH: [path.dirname(cli), path.dirname(process.execPath), "/usr/bin", "/bin"].join(":") };
+    for (const key of ["USER", "LOGNAME", "TMPDIR", "CODEX_HOME"]) if (process.env[key]) env[key] = process.env[key];
+    let cwd;
+    try { cwd = fs.mkdtempSync(path.join(require("os").tmpdir(), "agent-usage-widget-codex-")); }
+    catch { return resolve({ error: "codex_app_server_failed" }); }
+    let child;
+    let settled = false;
+    let result = null;
+    let buffer = "";
+    let received = 0;
+    const cleanupDir = () => { try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {} };
+    // The child leads its own process group, so killing the group also takes any helper
+    // processes it started with it.
+    const killGroup = () => {
+      if (!child?.pid) return;
+      try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+    };
+    let finalTimer = null;
+    let closed = false;
+    let resolved = false;
+    const done = () => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      clearTimeout(finalTimer);
+      cleanupDir();
+      resolve(result);
+    };
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      result = value;
+      killGroup();
+      // Resolve once the child has been reaped ("close"), so no zombie is left; a bounded
+      // wait guards against a child that somehow never reports back.
+      if (closed) return done();
+      finalTimer = setTimeout(done, 3000);
+    };
+    const timer = setTimeout(() => finish({ error: "codex_app_server_timeout" }), CODEX_APP_SERVER_TIMEOUT_MS);
+    const send = message => { try { child.stdin.write(`${JSON.stringify(message)}\n`); } catch {} };
+    try {
+      child = spawn(cli, ["app-server"], { cwd, env, stdio: ["pipe", "pipe", "ignore"], detached: true });
+    } catch {
+      clearTimeout(timer);
+      cleanupDir();
+      return resolve({ error: "codex_app_server_failed" });
+    }
+    // "close" (not "exit") so every line already written is processed first.
+    child.once("close", () => {
+      closed = true;
+      if (settled) done(); else finish({ error: "codex_app_server_exited" });
+    });
+    child.on("error", () => finish({ error: "codex_app_server_failed" }));
+    child.stdin.on("error", () => {});
+    child.stdout.on("data", chunk => {
+      received += chunk.length;
+      if (received > CODEX_APP_SERVER_MAX_OUTPUT) return finish({ error: "codex_app_server_bad_output" });
+      buffer += chunk.toString("utf8");
+      let newline;
+      while (!settled && (newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        let message;
+        try { message = JSON.parse(line); } catch { continue; }
+        // Notifications and anything else without our ids are ignored.
+        if (!message || typeof message !== "object") continue;
+        if (message.id === 1) {
+          if (message.error || !message.result) return finish({ error: "codex_app_server_init_failed" });
+          send({ id: 2, method: "account/rateLimits/read", params: {} });
+        } else if (message.id === 2) {
+          const rateLimits = message.result?.rateLimits;
+          if (message.error || !rateLimits || typeof rateLimits !== "object") return finish({ error: "codex_app_server_bad_output" });
+          return finish({ rateLimits });
+        }
+      }
+    });
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "agent-usage-widget", version: "1.0" } } });
+  });
+}
+
+// Background refreshes ask the app-server at most once per ten minutes (counting failures);
+// the refresh button at most once per minute. A failure never revives an older number:
+// the caller falls through to the next source instead.
+async function fetchCodexAppServerUsage({ manual = false } = {}) {
+  const cached = readCodexUsageCache();
+  const cachedAge = cached ? Date.now() - Date.parse(cached.fetchedAt || "") : NaN;
+  const cacheFresh = cached?.source === "app_server" && Number.isFinite(cachedAge) && cachedAge >= -5000 && cachedAge < CODEX_APP_SERVER_POLL_MS;
+  // A record from the "future" (clock moved back) also counts as recent.
+  const sinceAttempt = Math.abs(Date.now() - readCodexAppServerState());
+  if (!manual && cacheFresh) return { ...cached, cache: "cached" };
+  if (sinceAttempt < (manual ? CODEX_APP_SERVER_MANUAL_MS : CODEX_APP_SERVER_POLL_MS)) {
+    return cacheFresh ? { ...cached, cache: "cached" } : { available: false, error: "codex_app_server_throttled" };
+  }
+  const cli = resolveCodexCliPath();
+  if (!cli) return { available: false, error: "codex_cli_missing" };
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(CODEX_APP_SERVER_STATE, JSON.stringify({ lastAttemptAt: Date.now() }), { mode: 0o600 });
+  } catch { return { available: false, error: "codex_app_server_state_unwritable" }; }
+  const answer = await runCodexAppServer(cli);
+  if (!answer?.rateLimits) return { available: false, error: answer?.error || "codex_app_server_failed" };
+  const official = normalizeCodexAppServerLimits(answer.rateLimits);
+  if (!official.available) return { available: false, error: "codex_app_server_no_windows" };
+  writeCodexUsageCache(official);
+  return { ...official, cache: "live" };
 }
 
 // The OAuth material the Codex CLI itself uses. Held in memory only: never cached, logged,
@@ -847,6 +1000,7 @@ function isUsableObservation(official) {
   const age = nowMs - Date.parse(official?.fetchedAt || "");
   if (!Number.isFinite(age) || age < -5000) return false;
   if (official.source === "session_record") return age <= 2 * 86400000;
+  if (official.source === "app_server") return age <= CODEX_APP_SERVER_POLL_MS;
   return age <= (official.source?.startsWith("oauth_") ? CLAUDE_POLL_MS : 180000);
 }
 
@@ -1025,7 +1179,13 @@ function chooseCodexObservation(official, recorded) {
 
 async function summarizeCodex() {
   const hour = emptyBucket(), week = emptyBucket();
-  const live = await fetchCodexOfficialUsage({ force: process.argv.includes("--refresh") || process.argv.includes("--refresh-codex") });
+  const force = process.argv.includes("--refresh") || process.argv.includes("--refresh-codex");
+  // Order: app-server, then the direct HTTP endpoint, then the session records below.
+  let live = force ? await fetchCodexAppServerUsage({ manual: MANUAL_REFRESH }) : null;
+  if (!live?.available) {
+    const http = await fetchCodexOfficialUsage({ force });
+    if (http.available || !live) live = http;
+  }
   const files = recentCodexFiles();
   const records = files.map(lastCodexRateLimitEvent).filter(Boolean).sort((a,b) => Date.parse(b.fetchedAt) - Date.parse(a.fetchedAt));
   const official = chooseCodexObservation(live, records[0]);
@@ -1124,7 +1284,7 @@ function buildText(summary) {
   // the number is live.
   const codexAge = x.official?.source === "session_record"
     ? (LANG === "en" ? " (last record " : "（最後紀錄 ") + new Date(x.official.fetchedAt).toLocaleTimeString(T.locale, { hour: "2-digit", minute: "2-digit", hour12: false }) + (LANG === "en" ? ")" : "）")
-    : "";
+    : (x.official?.available && x.official.fetchedAt ? T.dataAge(formatAge(nowMs - Date.parse(x.official.fetchedAt))) : "");
   // "no such window on this plan" is a different fact from "could not read it", and the
   // live endpoint can tell them apart: it reports the absent window explicitly.
   const codexNoFiveHour = x.official?.available === true && !x.official.fiveHour;
@@ -1267,6 +1427,21 @@ if [[ -n "$CLAUDE_BIN" ]]; then
   chmod 600 "$INSTALL_DIR/claude-path"
 else
   rm -f "$INSTALL_DIR/claude-path"
+fi
+
+# The Codex CLI, used to read Codex quota through its own app-server (launchd's PATH has
+# no codex). Keep the link rather than its resolved target: a Homebrew cask upgrade
+# replaces the versioned directory but keeps the link.
+CODEX_BIN=""
+for candidate in "$(command -v codex 2>/dev/null || true)" /opt/homebrew/bin/codex /usr/local/bin/codex "$HOME/.local/bin/codex"; do
+  [[ -n "$candidate" && -x "$candidate" && -f "$candidate" ]] || continue
+  CODEX_BIN="$candidate"; break
+done
+if [[ -n "$CODEX_BIN" && "$CODEX_BIN" == /* ]]; then
+  printf '%s\n' "$CODEX_BIN" > "$INSTALL_DIR/codex-path"
+  chmod 600 "$INSTALL_DIR/codex-path"
+else
+  rm -f "$INSTALL_DIR/codex-path"
 fi
 
 echo "Using node: $NODE_BIN ($("$NODE_BIN" --version 2>/dev/null || echo unknown))"
@@ -2367,7 +2542,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         guard let date = parser.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp) else { return false }
         let age = Date().timeIntervalSince(date)
-        let lifetime: Double = source == "session_record" ? 172800 : ((source?.hasPrefix("oauth_") ?? false) ? 600 : 180)
+        // app_server: the Codex app-server is polled at most once per ten minutes.
+        let lifetime: Double = source == "session_record" ? 172800
+            : ((source?.hasPrefix("oauth_") ?? false) || source == "app_server" ? 600 : 180)
         return age >= -5 && age <= lifetime
     }
 

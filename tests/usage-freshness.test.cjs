@@ -23,6 +23,9 @@ const realReadClaudeCliLogin = readClaudeCliLogin;
 readClaudeCliLogin = () => { const token = readClaudeLongLivedLogin(); return token ? {accessToken: token, expiresAt: Date.now() + 3600000, hasProfileScope: true, hasRefresh: true} : {accessToken: "", expiresAt: null, hasProfileScope: false, hasRefresh: false}; };
 const realResolveClaudeCliPath = resolveClaudeCliPath;
 resolveClaudeCliPath = () => null;
+// 離線測試絕不啟動真的 codex：預設視為沒裝，個別測試再換成假 codex。
+const realResolveCodexCliPath = resolveCodexCliPath;
+resolveCodexCliPath = () => null;
 fetch = async () => { throw new Error("offline test forbids unexpected network"); };
 ${injection}
 main().catch(`));
@@ -1061,4 +1064,139 @@ main = async () => { const started = Date.now(); const login = readClaudeCliLogi
   const out = JSON.parse(execFileSync(process.execPath, [f.script], {env: {HOME: f.home, PATH: '/usr/bin:/bin'}, encoding: 'utf8', timeout: 15000}));
   assert.deepEqual(out.login, {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false});
   assert.ok(out.elapsed >= 4500 && out.elapsed <= 8000, `內層應約 5 秒結束，實際 ${out.elapsed} 毫秒`);
+});
+
+// Codex 額度改走 codex app-server（2026-10-27）。全離線：假 codex 腳本讀 stdin、回 initialize 與 rateLimits，中間夾無關通知。
+function codexFixture(t, {rateLimits = {primary: {usedPercent: 12, windowDurationMins: 10080, resetsAt: Math.round(Date.now()/1000) + 86400}, secondary: null, planType: 'fake-plan'}, mode = 'ok', timeoutMs = 15000} = {}) {
+  const f = fixture(t);
+  fs.rmSync(path.join(f.install, '.cache/codex-usage-percentages.json'), {force: true});
+  const fake = path.join(f.home, 'fake-codex');
+  const rl = JSON.stringify(rateLimits).replace(/'/g, "'\\''");
+  const head = `#!/bin/sh\necho run >> "$HOME/codex-runs.txt"\npwd > "$HOME/codex-cwd.txt"\nenv > "$HOME/codex-env.txt"\necho "$@" > "$HOME/codex-args.txt"\n`;
+  const body = {
+    ok: `/bin/sleep 300 &\necho $! > "$HOME/codex-child.pid"\nread line1\necho "$line1" > "$HOME/codex-in1.txt"\necho '{"method":"remoteControl/status/changed","params":{"status":"x"}}'\necho 'not json at all'\necho '{"id":1,"result":{"userAgent":"fake"}}'\nread line2\necho "$line2" > "$HOME/codex-in2.txt"\necho '{"id":99,"result":{"rateLimits":{"primary":{"usedPercent":99,"windowDurationMins":10080}}}}'\necho '{"method":"account/updated","params":{}}'\necho '{"id":2,"result":{"rateLimits":${rl}}}'\nexec /bin/sleep 30\n`,
+    hang: `echo $$ > "$HOME/codex-self.pid"\ntrap '' TERM\nexec /bin/sleep 60\n`,
+    fail: `read line1\nexit 3\n`,
+  }[mode];
+  fs.writeFileSync(fake, head + body, {mode: 0o755});
+  fs.writeFileSync(path.join(f.install, 'codex-path'), fake + '\n');
+  f.codexMock = (extra = '') => f.mock(`resolveCodexCliPath = realResolveCodexCliPath;
+CODEX_CLI_CANDIDATES = [];
+CODEX_APP_SERVER_TIMEOUT_MS = ${timeoutMs};
+${extra}`);
+  f.codexMock();
+  f.codexRuns = () => fs.existsSync(path.join(f.home, 'codex-runs.txt')) ? fs.readFileSync(path.join(f.home, 'codex-runs.txt'), 'utf8').trim().split('\n').length : 0;
+  f.setState = (agoMs) => fs.writeFileSync(path.join(f.install, '.cache/codex-app-server-poll.json'), JSON.stringify({lastAttemptAt: Date.now() - agoMs}));
+  f.ageCache = (agoMs) => {
+    const file = path.join(f.install, '.cache/codex-usage-percentages.json');
+    const cached = JSON.parse(fs.readFileSync(file, 'utf8'));
+    cached.fetchedAt = new Date(Date.now() - agoMs).toISOString();
+    fs.writeFileSync(file, JSON.stringify(cached));
+  };
+  return f;
+}
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+test('Codex app-server: 週窗解析成功、忽略無關行、程序與子程序都被收掉', t => {
+  const f = codexFixture(t);
+  const data = JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 1);
+  assert.equal(data.codex.official.source, 'app_server');
+  assert.equal(data.codex.official.cache, 'live');
+  assert.equal(data.codex.official.fiveHour, null);
+  assert.equal(data.codex.official.week.usedPercent, 12);
+  assert.equal(data.codex.rateLimits.secondary.used_percent, 12);
+  assert.equal(data.codex.rateLimits.primary, null);
+  assert.equal(fs.readFileSync(path.join(f.home, 'codex-args.txt'), 'utf8').trim(), 'app-server');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'codex-in1.txt'), 'utf8')).method, 'initialize');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'codex-in2.txt'), 'utf8')).method, 'account/rateLimits/read');
+  // 空的暫存工作目錄，用完即刪；環境變數只有最小集合
+  const cwd = fs.readFileSync(path.join(f.home, 'codex-cwd.txt'), 'utf8').trim();
+  assert.match(path.basename(cwd), /^agent-usage-widget-codex-/);
+  assert.equal(fs.existsSync(cwd), false);
+  const envKeys = fs.readFileSync(path.join(f.home, 'codex-env.txt'), 'utf8').trim().split('\n').map(l => l.split('=')[0]);
+  for (const key of envKeys) assert.ok(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'CODEX_HOME', 'PWD', 'SHLVL', '_', 'OLDPWD'].includes(key), `多餘的環境變數 ${key}`);
+  // 假程式起的背景子程序也要被收掉
+  assert.equal(alive(Number(fs.readFileSync(path.join(f.home, 'codex-child.pid'), 'utf8'))), false);
+  // 快取只有百分比與時間，不含方案等其他欄位
+  const cached = fs.readFileSync(path.join(f.install, '.cache/codex-usage-percentages.json'), 'utf8');
+  assert.doesNotMatch(cached, /fake-plan|planType|userAgent/);
+  const text = f.run('--text');
+  assert.match(text, /Codex 可用額度（\d+ 分鐘前資料）/);
+  assert.doesNotMatch(text, /最後紀錄/);
+  assert.match(text, /1 週 88%/);
+});
+test('Codex app-server: 有 5 小時窗時照視窗長度分類，不照位置', t => {
+  const reset = Math.round(Date.now()/1000) + 3600;
+  const f = codexFixture(t, {rateLimits: {primary: {usedPercent: 10, windowDurationMins: 10080, resetsAt: reset + 86400}, secondary: {usedPercent: 40, windowDurationMins: 300, resetsAt: reset}}});
+  const data = JSON.parse(f.run('--refresh'));
+  assert.equal(data.codex.official.fiveHour.usedPercent, 40);
+  assert.equal(data.codex.official.week.usedPercent, 10);
+  assert.equal(data.codex.rateLimits.primary.used_percent, 40);
+  assert.equal(data.codex.rateLimits.secondary.used_percent, 10);
+});
+test('Codex app-server: 卡住時逾時以 SIGKILL 結束並回固定錯誤碼', t => {
+  const f = codexFixture(t, {mode: 'hang', timeoutMs: 2000});
+  f.codexMock(`main = async () => { const started = Date.now(); const r = await fetchCodexAppServerUsage({manual: true}); process.stdout.write(JSON.stringify({r, elapsed: Date.now() - started})); };`);
+  const out = JSON.parse(f.run());
+  assert.deepEqual(out.r, {available: false, error: 'codex_app_server_timeout'});
+  assert.ok(out.elapsed >= 1800 && out.elapsed < 6000, `應約 2 秒結束，實際 ${out.elapsed} 毫秒`);
+  assert.equal(alive(Number(fs.readFileSync(path.join(f.home, 'codex-self.pid'), 'utf8'))), false);
+});
+test('Codex app-server: 找不到 codex 回 codex_cli_missing，退回下一個來源', t => {
+  const f = codexFixture(t);
+  fs.writeFileSync(path.join(f.install, 'codex-path'), path.join(f.home, 'no-such-codex') + '\n');
+  f.codexMock(`main = async () => { process.stdout.write(JSON.stringify(await fetchCodexAppServerUsage({manual: true}))); };`);
+  assert.deepEqual(JSON.parse(f.run()), {available: false, error: 'codex_cli_missing'});
+  f.codexMock();
+  record(f, {age: 60000, percent: 33});
+  const data = JSON.parse(f.run('--refresh'));
+  assert.equal(data.codex.official.source, 'session_record');
+  assert.equal(data.codex.rateLimits.secondary.used_percent, 33);
+});
+test('Codex app-server: 背景 10 分鐘內用快取不再啟動，滿 10 分鐘才再查', t => {
+  const f = codexFixture(t);
+  JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 1);
+  let data = JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 1);
+  assert.equal(data.codex.official.source, 'app_server');
+  assert.equal(data.codex.official.cache, 'cached');
+  assert.equal(data.codex.rateLimits.secondary.used_percent, 12);
+  // 9 分鐘前查過、快取 9 分鐘：仍用快取
+  f.setState(9 * 60000); f.ageCache(9 * 60000);
+  data = JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 1);
+  assert.equal(data.codex.rateLimits.secondary.used_percent, 12);
+  // 滿 10 分鐘：再查一次
+  f.setState(10 * 60000 + 1000); f.ageCache(10 * 60000 + 1000);
+  data = JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 2);
+  assert.equal(data.codex.official.cache, 'live');
+});
+test('Codex app-server: 手動更新最少間隔 60 秒', t => {
+  const f = codexFixture(t);
+  JSON.parse(f.run('--refresh', '--manual'));
+  assert.equal(f.codexRuns(), 1);
+  let data = JSON.parse(f.run('--refresh', '--manual'));
+  assert.equal(f.codexRuns(), 1);
+  assert.equal(data.codex.official.cache, 'cached');
+  f.setState(61000);
+  data = JSON.parse(f.run('--refresh', '--manual'));
+  assert.equal(f.codexRuns(), 2);
+  assert.equal(data.codex.official.cache, 'live');
+  // 背景在 61 秒後、快取仍新：不啟動
+  f.setState(61000);
+  JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 2);
+});
+test('Codex app-server: 失敗不復活舊數字，且失敗也算進 10 分鐘節流', t => {
+  const f = codexFixture(t, {mode: 'fail'});
+  fs.writeFileSync(path.join(f.install, '.cache/codex-usage-percentages.json'), JSON.stringify({available: true, source: 'app_server', fetchedAt: new Date(Date.now() - 11 * 60000).toISOString(), fiveHour: null, week: {usedPercent: 5, resetsAt: Date.now()/1000 + 86400}}));
+  let data = JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 1);
+  assert.equal(data.codex.official.available, false);
+  assert.equal(data.codex.rateLimits?.secondary?.used_percent ?? null, null);
+  data = JSON.parse(f.run('--refresh'));
+  assert.equal(f.codexRuns(), 1);
+  assert.equal(data.codex.rateLimits?.secondary?.used_percent ?? null, null);
 });
