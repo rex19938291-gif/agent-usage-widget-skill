@@ -202,11 +202,18 @@ function readClaudeLongLivedLogin() {
 // setup-token logins lack the user:profile scope that /api/oauth/usage requires, so the
 // per-model weekly window can only be read with this one. Held in memory only; never
 // refreshed, written back, cached or printed here.
+// External-command layer only (replaced in tests): a hard five-second cap, killed with
+// SIGKILL so a stuck or prompt-blocked `security` cannot hold the refresh.
+let CLAUDE_SECURITY_BIN = "/usr/bin/security";
+function readClaudeKeychainRaw() {
+  return execFileSync(CLAUDE_SECURITY_BIN, ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+    { encoding: "utf8", timeout: 5000, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "ignore"] }).trim();
+}
+
 function readClaudeCliLogin() {
   const empty = { accessToken: "", expiresAt: null, hasProfileScope: false, hasRefresh: false };
   try {
-    const raw = execFileSync("/usr/bin/security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
-      { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const raw = readClaudeKeychainRaw();
     const login = JSON.parse(raw)?.claudeAiOauth;
     if (!login || typeof login !== "object") return empty;
     const expiresAt = Number(login.expiresAt);
@@ -229,8 +236,12 @@ function claudeCliLoginUsable(login) {
 const CLAUDE_CLI_RENEW_STATE = path.join(CACHE_DIR, "claude-cli-renew.json");
 const CLAUDE_CLI_RENEW_COOLDOWN_MS = 10 * 60 * 1000;
 let CLAUDE_CLI_RENEW_TIMEOUT_MS = 60 * 1000;
-const CLAUDE_CLI_RENEW_ARGS = ["-p", "ok", "--model", "haiku", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-  "--setting-sources", "local", "--disable-slash-commands", "--no-session-persistence"];
+// No hooks, plugins, MCP servers or project files may run here. --safe-mode (2.1.309
+// --help: hooks, plugins, MCP, CLAUDE.md and more disabled; auth works normally) plus the
+// disableAllHooks setting, and the CLI runs in a fresh empty directory (see below).
+const CLAUDE_CLI_RENEW_ARGS = ["-p", "ok", "--model", "haiku", "--safe-mode", "--settings", '{"disableAllHooks":true}',
+  "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "local",
+  "--disable-slash-commands", "--no-session-persistence"];
 
 function resolveClaudeCliPath() {
   const usable = file => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
@@ -260,13 +271,17 @@ function renewClaudeCliLogin(login) {
   } catch { return false; } // Without a cooldown record, do not risk repeated runs.
   // Minimal environment, built from scratch: the long-lived token and any API key are
   // never passed, so the CLI uses its own Keychain login.
-  const env = { HOME, PATH: "/usr/bin:/bin" };
+  const env = { HOME, PATH: "/usr/bin:/bin", CLAUDE_CODE_SAFE_MODE: "1" };
   for (const key of ["USER", "LOGNAME", "TMPDIR"]) if (process.env[key]) env[key] = process.env[key];
+  // A new empty directory each time: no project or local settings can be picked up.
+  let cwd;
+  try { cwd = fs.mkdtempSync(path.join(require("os").tmpdir(), "agent-usage-widget-renew-")); } catch { return false; }
   try {
-    execFileSync(cli, CLAUDE_CLI_RENEW_ARGS, { env, cwd: INSTALL_DIR, timeout: CLAUDE_CLI_RENEW_TIMEOUT_MS,
+    execFileSync(cli, CLAUDE_CLI_RENEW_ARGS, { env, cwd, timeout: CLAUDE_CLI_RENEW_TIMEOUT_MS,
       stdio: "ignore", killSignal: "SIGKILL" });
     return true;
   } catch { return false; }
+  finally { try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {} }
 }
 
 // Server labels are display text only: a bounded plain string, never an object.

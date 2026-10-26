@@ -19,6 +19,7 @@ function fixture(t, age = 0, expired = false) {
 readClaudeLongLivedLogin = () => "";
 readClaudeDesktopSession = () => ({});
 // 離線測試絕不讀真的鑰匙圈：預設把 CLI 登入視為與長效登入同一組假權杖、未過期、有 user:profile。
+const realReadClaudeCliLogin = readClaudeCliLogin;
 readClaudeCliLogin = () => { const token = readClaudeLongLivedLogin(); return token ? {accessToken: token, expiresAt: Date.now() + 3600000, hasProfileScope: true, hasRefresh: true} : {accessToken: "", expiresAt: null, hasProfileScope: false, hasRefresh: false}; };
 const realResolveClaudeCliPath = resolveClaudeCliPath;
 resolveClaudeCliPath = () => null;
@@ -890,11 +891,9 @@ function cliFixture(t, {expired = true, hasRefresh = true, profile = true, cli =
   f.cliMock = (extra = '') => f.mock(`readClaudeLongLivedLogin = () => "dummy-long-lived";
 resolveClaudeCliPath = realResolveClaudeCliPath;
 CLAUDE_CLI_RENEW_TIMEOUT_MS = ${cli === 'hang' ? 3000 : 30000};
-readClaudeCliLogin = () => {
-  try { const o = JSON.parse(fs.readFileSync(path.join(HOME, 'fake-keychain.json'), 'utf8'));
-    return {accessToken: o.accessToken, expiresAt: o.expiresAt, hasProfileScope: o.scopes.includes('user:profile'), hasRefresh: !!o.refreshToken};
-  } catch { return {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false}; }
-};
+// 只替換外部命令層：正式的 readClaudeCliLogin 解析 claudeAiOauth 包裝。
+readClaudeCliLogin = realReadClaudeCliLogin;
+readClaudeKeychainRaw = () => JSON.stringify({claudeAiOauth: JSON.parse(fs.readFileSync(path.join(HOME, 'fake-keychain.json'), 'utf8'))});
 ${extra}
 fetch = async (url, options) => {
   const name = url.endsWith('/api/oauth/usage') ? 'usage' : 'messages';
@@ -968,15 +967,20 @@ for (const [name, opts, code] of [['沒有更新值', {hasRefresh: false}, 'cli_
     assert.equal(JSON.parse(fs.readFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'))).usageError, code);
   });
 }
-test('CLI 登入: 子程序環境不帶長效權杖與 API 金鑰，工作目錄是安裝資料夾，參數不載 MCP', t => {
+test('CLI 登入: 子程序環境不帶長效權杖與 API 金鑰，在新建後即刪的空暫存目錄執行，參數停用 hooks 與 MCP', t => {
   const f = cliFixture(t);
   execFileSync(process.execPath, [f.script, '--quota-only', '--refresh', '--manual'], {encoding: 'utf8', timeout: RUN_TIMEOUT,
     env: {HOME: f.home, PATH: '/usr/bin:/bin', CLAUDE_CODE_OAUTH_TOKEN: 'parent-long-lived-secret', ANTHROPIC_API_KEY: 'parent-api-key'}});
   const env = fs.readFileSync(path.join(f.home, 'cli-env.txt'), 'utf8');
   assert.doesNotMatch(env, /CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|parent-/);
   assert.match(env, /^PATH=\/usr\/bin:\/bin$/m);
-  assert.equal(fs.realpathSync(fs.readFileSync(path.join(f.home, 'cli-cwd.txt'), 'utf8').trim()), fs.realpathSync(f.install));
-  assert.match(fs.readFileSync(path.join(f.home, 'cli-args.txt'), 'utf8'), /^-p ok --model haiku --strict-mcp-config --mcp-config \{"mcpServers":\{\}\} --setting-sources local/);
+  assert.match(env, /^CLAUDE_CODE_SAFE_MODE=1$/m);
+  const cwd = fs.readFileSync(path.join(f.home, 'cli-cwd.txt'), 'utf8').trim();
+  assert.match(path.basename(cwd), /^agent-usage-widget-renew-/);
+  assert.notEqual(cwd, f.install);
+  assert.equal(fs.existsSync(cwd), false);
+  assert.equal(fs.readFileSync(path.join(f.home, 'cli-args.txt'), 'utf8').trim(),
+    '-p ok --model haiku --safe-mode --settings {"disableAllHooks":true} --strict-mcp-config --mcp-config {"mcpServers":{}} --setting-sources local --disable-slash-commands --no-session-persistence');
 });
 test('CLI 登入: 假權杖、假更新值不出現在輸出與任何保存檔', t => {
   const f = cliFixture(t);
@@ -987,10 +991,70 @@ test('CLI 登入: 假權杖、假更新值不出現在輸出與任何保存檔',
 });
 test('CLI 登入: 讀鑰匙圈失敗時不影響標頭來源', t => {
   const f = cliFixture(t);
-  f.cliMock(`readClaudeCliLogin = () => ({accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false});`);
+  f.cliMock(`readClaudeKeychainRaw = () => { throw new Error('security exited 44'); };`);
   const data = JSON.parse(f.run('--refresh', '--manual'));
   assert.equal(f.runs(), 0);
   assert.equal(data.claude.official.fiveHour.usedPercent, 39);
   assert.equal(data.claude.official.weekScoped.usedPercent, null);
   assert.equal(JSON.parse(fs.readFileSync(path.join(f.install, '.cache/claude-oauth-poll.json'))).usageError, 'cli_login_missing');
+});
+
+test('CLI 登入: 續期時 hooks 不會執行（安裝資料夾與家目錄都放了會觸發的 hook 設定）', t => {
+  const f = cliFixture(t);
+  // 假 CLI（node 腳本）：只要「工作目錄或家目錄有 hook 設定」且「參數沒有停用 hooks」，就建立標記檔，模擬 hook 被執行。
+  const script = path.join(f.home, 'fake-claude-hooks.js');
+  fs.writeFileSync(script, `#!${process.execPath}
+const fs = require('fs'), path = require('path');
+const args = process.argv.slice(2);
+fs.writeFileSync(path.join(process.env.HOME, 'hook-args.json'), JSON.stringify({args, cwd: process.cwd()}));
+const settings = [path.join(process.cwd(), '.claude/settings.local.json'), path.join(process.cwd(), '.claude/settings.json'), path.join(process.env.HOME, '.claude/settings.json')];
+const hasHooks = settings.some(file => { try { return !!JSON.parse(fs.readFileSync(file, 'utf8')).hooks; } catch { return false; } });
+const settingsArg = args.indexOf('--settings') >= 0 ? args[args.indexOf('--settings') + 1] : '';
+let disabledBySetting = false; try { disabledBySetting = JSON.parse(settingsArg).disableAllHooks === true; } catch {}
+const disabled = args.includes('--safe-mode') && disabledBySetting && process.env.CLAUDE_CODE_SAFE_MODE === '1';
+if (hasHooks && !disabled) fs.writeFileSync(path.join(process.env.HOME, 'HOOK-RAN'), '1');
+`, {mode: 0o755});
+  fs.writeFileSync(path.join(f.install, 'claude-path'), script + '\n');
+  const hook = JSON.stringify({hooks: {UserPromptSubmit: [{hooks: [{type: 'command', command: 'touch "$HOME/HOOK-RAN"'}]}]}});
+  for (const dir of [path.join(f.install, '.claude'), path.join(f.home, '.claude')]) { fs.mkdirSync(dir, {recursive: true}); }
+  fs.writeFileSync(path.join(f.install, '.claude/settings.local.json'), hook);
+  fs.writeFileSync(path.join(f.home, '.claude/settings.json'), hook);
+  f.run('--refresh', '--manual');
+  const seen = JSON.parse(fs.readFileSync(path.join(f.home, 'hook-args.json'), 'utf8'));
+  assert.equal(fs.existsSync(path.join(f.home, 'HOOK-RAN')), false);
+  assert.notEqual(seen.cwd, f.install);
+  assert.ok(seen.args.includes('--safe-mode'));
+  // 反向對照：同一個假 CLI 在安裝資料夾、不帶停用參數時確實會留下標記，證明判斷邏輯有效。
+  execFileSync(script, ['-p', 'ok'], {cwd: f.install, env: {HOME: f.home, PATH: '/usr/bin:/bin'}, timeout: RUN_TIMEOUT});
+  assert.equal(fs.existsSync(path.join(f.home, 'HOOK-RAN')), true);
+});
+function keychainRun(t, inject) {
+  const f = fixture(t);
+  f.mock(`readClaudeCliLogin = realReadClaudeCliLogin;
+${inject}
+main = async () => { process.stdout.write(JSON.stringify(readClaudeCliLogin())); };`);
+  return JSON.parse(f.run());
+}
+test('鑰匙圈解析: 正式解析 claudeAiOauth 包裝，只回四個欄位', t => {
+  const r = keychainRun(t, `readClaudeKeychainRaw = () => JSON.stringify({claudeAiOauth: {accessToken: 'fake-a', expiresAt: 1893456000000, scopes: ['user:inference', 'user:profile'], refreshToken: 'fake-r', subscriptionType: 'max'}});`);
+  assert.deepEqual(r, {accessToken: 'fake-a', expiresAt: 1893456000000, hasProfileScope: true, hasRefresh: true});
+});
+for (const [name, raw, expected] of [
+  ['缺 claudeAiOauth', JSON.stringify({other: {}}), {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false}],
+  ['缺欄位', JSON.stringify({claudeAiOauth: {}}), {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false}],
+  ['型別錯', JSON.stringify({claudeAiOauth: {accessToken: 123, expiresAt: 'soon', scopes: 'user:profile', refreshToken: {x: 1}}}), {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false}],
+  ['不是 JSON', 'not-json', {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false}],
+]) {
+  test(`鑰匙圈解析: ${name}時回空登入`, t => {
+    assert.deepEqual(keychainRun(t, `readClaudeKeychainRaw = () => ${JSON.stringify(raw)};`), expected);
+  });
+}
+test('鑰匙圈讀取: security 卡住且忽略終止訊號時，5 秒強制結束並回空登入', t => {
+  const fake = path.join(fs.mkdtempSync(path.join(__dirname, '../.test-tmp/sec-')), 'security');
+  t.after(() => fs.rmSync(path.dirname(fake), {recursive: true, force: true}));
+  fs.writeFileSync(fake, "#!/bin/sh\ntrap '' TERM\nexec /bin/sleep 60\n", {mode: 0o755});
+  const started = Date.now();
+  const r = keychainRun(t, `CLAUDE_SECURITY_BIN = ${JSON.stringify(fake)};`);
+  assert.deepEqual(r, {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false});
+  assert.ok(Date.now() - started < 30000, '必須在 sleep 60 之前結束');
 });
