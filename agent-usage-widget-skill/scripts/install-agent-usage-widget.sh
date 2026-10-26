@@ -1811,7 +1811,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         visual.needsDisplay = true
     }
 
-    // Loading and every failed read put the Codex 5-hour row back as unknown: a hidden row
+    // Every failed read puts the Codex 5-hour row back as unknown: a hidden row
     // must only ever mean fresh data said "this plan has no 5-hour window".
     private func showCodexFiveHourUnknown() {
         setCodexFiveHourVisible(true)
@@ -1819,8 +1819,10 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         codexFiveReset.stringValue = "--"
     }
 
+    // Loading keeps whatever the row showed last: restoring it here made the panel jump
+    // between four and five rows on every 60-second refresh. Failure, stale or unavailable
+    // data restore it instead (refreshFailedUI / updateUI).
     private func beginLoadingUI() {
-        showCodexFiveHourUnknown()
         setStatus(Strings.current.updating)
         refreshButton.alphaValue = 0.4
     }
@@ -1866,8 +1868,8 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         expect("initial (loading)", rows: 2, percent: "--%", reset: "--")
         updateUI(noWindow); expect("fresh data, fiveHour explicitly null", rows: 1)
         if panel.frame.maxY != topBefore { problems.append("top edge moved when hiding") }
-        beginLoadingUI(); expect("refresh started", rows: 2, percent: "--%", reset: "--")
-        applyLanguage(); expect("language switch while loading", rows: 2, percent: "--%", reset: "--")
+        beginLoadingUI(); expect("refresh started keeps four rows", rows: 1)
+        applyLanguage(); expect("language switch while loading", rows: 1)
         updateUI(noWindow); expect("fresh no-window again", rows: 1)
         applyLanguage(); expect("language switch while hidden", rows: 1)
         refreshFailedUI(); expect("child failed / timed out / bad output", rows: 2, percent: "--%", reset: "--")
