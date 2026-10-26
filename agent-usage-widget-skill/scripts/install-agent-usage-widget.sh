@@ -1193,7 +1193,24 @@ struct ClaudeScopedLimit: Decodable { let usedPercent: Double?; let resetsAt: Do
 struct CodexSummary: Decodable { let rateLimits: RateLimits?; let official: CodexOfficial? }
 // available with a nil window means the plan genuinely has no such limit — distinct from
 // being unable to read it, which leaves available false.
-struct CodexOfficial: Decodable { let source: String?; let fetchedAt: String?; let cache: String?; let error: String?; let available: Bool?; let fiveHour: CodexLimit?; let week: CodexLimit? }
+struct CodexOfficial: Decodable {
+    let source: String?; let fetchedAt: String?; let cache: String?; let error: String?; let available: Bool?; let fiveHour: CodexLimit?; let week: CodexLimit?
+    // True only when the key is present and literally null. A missing key (older script,
+    // partial output) is "unknown", which must keep the 5-hour row on screen as --%.
+    let fiveHourExplicitlyNull: Bool
+    private enum CodingKeys: String, CodingKey { case source, fetchedAt, cache, error, available, fiveHour, week }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        source = try c.decodeIfPresent(String.self, forKey: .source)
+        fetchedAt = try c.decodeIfPresent(String.self, forKey: .fetchedAt)
+        cache = try c.decodeIfPresent(String.self, forKey: .cache)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        available = try c.decodeIfPresent(Bool.self, forKey: .available)
+        fiveHour = try c.decodeIfPresent(CodexLimit.self, forKey: .fiveHour)
+        week = try c.decodeIfPresent(CodexLimit.self, forKey: .week)
+        fiveHourExplicitlyNull = c.contains(.fiveHour) ? ((try? c.decodeNil(forKey: .fiveHour)) ?? false) : false
+    }
+}
 struct CodexLimit: Decodable { let usedPercent: Double?; let resetsAt: Double? }
 struct RateLimits: Decodable { let primary: RateLimitWindow?; let secondary: RateLimitWindow? }
 struct RateLimitWindow: Decodable { let used_percent: Double?; let resets_at: Double?; let observed_at: Double? }
@@ -1647,7 +1664,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh(forceClaude: true) }
     }
 
-    private func buildPanel() {
+    private func buildPanel(show: Bool = true) {
         // One vertical rhythm for the whole panel: every quota row is Metrics.rowPitch
         // apart and Metrics.rowHeight tall, so the gaps read as identical.
         let frame = NSRect(x: 18, y: 18, width: Metrics.width, height: Metrics.height)
@@ -1721,6 +1738,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
 
         panel.contentView = visual
         positionTopLeft()
+        guard show else { return }
         panel.orderFront(nil)
         panel.orderBack(nil)
     }
@@ -1742,7 +1760,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         // are re-rendered from the last summary rather than reset to their initial text —
         // switching language must not look like the numbers went stale.
         if let lastSummary {
-            updateUI(lastSummary)
+            // Re-rendering cached data may keep an already-hidden row hidden, but must never
+            // hide a row that loading or a failed read has just brought back.
+            updateUI(lastSummary, allowHidingCodexFiveHour: Metrics.codexRowCount == 1)
             if isRefreshing { setStatus(strings.updating) }
         } else {
             titleLabel.stringValue = strings.codexTitle
@@ -1789,6 +1809,76 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         claudeTitle.frame.origin.y = Metrics.claudeTitleY
         layOutStatusRow()
         visual.needsDisplay = true
+    }
+
+    // Loading and every failed read put the Codex 5-hour row back as unknown: a hidden row
+    // must only ever mean fresh data said "this plan has no 5-hour window".
+    private func showCodexFiveHourUnknown() {
+        setCodexFiveHourVisible(true)
+        codexFivePercent.stringValue = "--%"
+        codexFiveReset.stringValue = "--"
+    }
+
+    private func beginLoadingUI() {
+        showCodexFiveHourUnknown()
+        setStatus(Strings.current.updating)
+        refreshButton.alphaValue = 0.4
+    }
+
+    private func refreshFailedUI() {
+        showCodexFiveHourUnknown()
+        setStatus(Strings.current.updateFailed)
+    }
+
+    // Drives the row through every transition on a never-shown panel and reports any step
+    // whose row count, visibility or cell text is wrong. Used by --check-row-toggle.
+    func runRowToggleCheck() -> [String] {
+        buildPanel(show: false)
+        var problems: [String] = []
+        func expect(_ step: String, rows: Int, percent: String? = nil, reset: String? = nil) {
+            let hidden = codexFiveLabel.isHidden
+            let ok = Metrics.codexRowCount == rows && hidden == (rows == 1)
+                && codexFivePercent.isHidden == hidden && codexFiveReset.isHidden == hidden
+                && panel.frame.height == Metrics.height
+                && (percent == nil || codexFivePercent.stringValue == percent)
+                && (reset == nil || codexFiveReset.stringValue == reset)
+            print(String(format: "%-40s rows=%d hidden=%@ percent=%@ reset=%@ height=%.0f  %@",
+                         (step as NSString).utf8String!, Metrics.codexRowCount, hidden ? "yes" : "no",
+                         codexFivePercent.stringValue, codexFiveReset.stringValue, panel.frame.height, ok ? "ok" : "PROBLEM"))
+            if !ok { problems.append(step) }
+        }
+        let now = ISO8601DateFormatter().string(from: Date())
+        let old = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-7200))
+        func summary(_ codexOfficial: String, at: String) -> UsageSummary {
+            let json = """
+            {"generatedAt":"\(at)","claude":{"official":null},
+             "codex":{"rateLimits":{"primary":{"used_percent":40,"resets_at":2000000000},"secondary":{"used_percent":10,"resets_at":2000000000}},
+                      "official":\(codexOfficial)}}
+            """
+            return try! JSONDecoder().decode(UsageSummary.self, from: Data(json.utf8))
+        }
+        let noWindow = summary(#"{"source":"live","available":true,"fetchedAt":"\#(now)","fiveHour":null,"week":{"usedPercent":10}}"#, at: now)
+        let missingKey = summary(#"{"source":"live","available":true,"fetchedAt":"\#(now)","week":{"usedPercent":10}}"#, at: now)
+        let withWindow = summary(#"{"source":"live","available":true,"fetchedAt":"\#(now)","fiveHour":{"usedPercent":40},"week":{"usedPercent":10}}"#, at: now)
+        let staleNoWindow = summary(#"{"source":"live","available":true,"fetchedAt":"\#(old)","fiveHour":null,"week":{"usedPercent":10}}"#, at: old)
+        let unavailable = summary(#"{"source":"live","available":false,"fetchedAt":"\#(now)","fiveHour":null}"#, at: now)
+        let topBefore = panel.frame.maxY
+        expect("initial (loading)", rows: 2, percent: "--%", reset: "--")
+        updateUI(noWindow); expect("fresh data, fiveHour explicitly null", rows: 1)
+        if panel.frame.maxY != topBefore { problems.append("top edge moved when hiding") }
+        beginLoadingUI(); expect("refresh started", rows: 2, percent: "--%", reset: "--")
+        applyLanguage(); expect("language switch while loading", rows: 2, percent: "--%", reset: "--")
+        updateUI(noWindow); expect("fresh no-window again", rows: 1)
+        applyLanguage(); expect("language switch while hidden", rows: 1)
+        refreshFailedUI(); expect("child failed / timed out / bad output", rows: 2, percent: "--%", reset: "--")
+        applyLanguage(); expect("language switch after failure", rows: 2, percent: "--%", reset: "--")
+        updateUI(missingKey); expect("fiveHour key missing (unknown)", rows: 2, percent: "60%")
+        updateUI(staleNoWindow); expect("stale data with null fiveHour", rows: 2, percent: "--%", reset: "--")
+        updateUI(unavailable); expect("official unavailable", rows: 2, percent: "--%", reset: "--")
+        updateUI(noWindow); expect("fresh no-window before recovery", rows: 1)
+        updateUI(withWindow); expect("plan has 5-hour window again", rows: 2, percent: "60%")
+        if panel.frame.maxY != topBefore { problems.append("top edge moved after restoring") }
+        return problems
     }
 
     private func positionTopLeft() {
@@ -1938,15 +2028,13 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     private func refresh(forceClaude: Bool = false, manual: Bool = false) {
         if isRefreshing {
             if manual { pendingManualRefresh = true }
-            setStatus(Strings.current.updating)
-            refreshButton.alphaValue = 0.4
+            beginLoadingUI()
             return
         }
         isRefreshing = true
         let token = UUID()
         activeRefreshToken = token
-        setStatus(Strings.current.updating)
-        refreshButton.alphaValue = 0.4
+        beginLoadingUI()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let process = Process()
@@ -1987,7 +2075,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
                 reader.readabilityHandler = nil
                 try? reader.close()
                 DispatchQueue.main.async {
-                    self.setStatus(Strings.current.updateFailed)
+                    self.refreshFailedUI()
                     self.finishRefresh(token)
                 }
                 return
@@ -2017,7 +2105,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
                     self.lastCompletedAt = Date()
                     self.updateUI(summary)
                 } else {
-                    self.setStatus(Strings.current.updateFailed)
+                    self.refreshFailedUI()
                 }
                 self.finishRefresh(token)
             }
@@ -2036,7 +2124,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func updateUI(_ summary: UsageSummary) {
+    private func updateUI(_ summary: UsageSummary, allowHidingCodexFiveHour: Bool = true) {
         lastSummary = summary
         let strings = Strings.current
         let primary = summary.codex.rateLimits?.primary
@@ -2051,15 +2139,17 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         let claudeScopedRemaining = claudeFresh ? remainingPercent(fromUsed: claude?.weekScoped?.usedPercent) : nil
         // The live endpoint distinguishes "this plan has no 5-hour window" from "unknown",
         // so name the absent window rather than showing --% as if the read had failed.
-        let codexNoFiveHour = codexFresh && summary.codex.official?.available == true && summary.codex.official?.fiveHour == nil
+        let codexNoFiveHour = codexFresh && summary.codex.official?.available == true
+            && summary.codex.official?.fiveHour == nil && summary.codex.official?.fiveHourExplicitlyNull == true
         // The plan simply has no such window: leave the percent cell empty and say so in
         // the wider reset cell, instead of a "None / —" pair that reads like a failed read.
         // Only hide the row on a positive "no such window" answer from fresh live data;
         // while loading or after a failed read the row stays and shows --%.
-        setCodexFiveHourVisible(!codexNoFiveHour)
-        codexFivePercent.stringValue = codexNoFiveHour ? "" : formatPercent(codexFiveRemaining)
+        let hideCodexFiveHour = codexNoFiveHour && allowHidingCodexFiveHour
+        setCodexFiveHourVisible(!hideCodexFiveHour)
+        codexFivePercent.stringValue = codexNoFiveHour ? "--%" : formatPercent(codexFiveRemaining)
         codexWeekPercent.stringValue = formatPercent(codexWeekRemaining)
-        codexFiveReset.stringValue = codexNoFiveHour ? strings.noWindowOnPlan : formatReset(codexFresh ? primary?.resets_at : nil, compact: false)
+        codexFiveReset.stringValue = codexNoFiveHour ? "--" : formatReset(codexFresh ? primary?.resets_at : nil, compact: false)
         codexWeekReset.stringValue = formatRecovery(codexFresh ? secondary?.resets_at : nil, remaining: codexWeekRemaining, compact: true)
         claudeFivePercent.stringValue = formatPercent(claudeFiveRemaining)
         claudeWeekPercent.stringValue = formatPercent(claudeWeekRemaining)
@@ -2287,6 +2377,17 @@ func runHeadless(_ command: String) -> Never {
             exit(1)
         }
         print("\nno overflow in either language, in both the 5-row and 4-row layouts")
+    case "--check-row-toggle":
+        // Exercises hide/restore of the Codex 5-hour row through loading, failure, language
+        // switch, missing key, stale data and recovery, on a panel that is never shown.
+        _ = NSApplication.shared
+        let widget = UsageWidget()
+        let problems = withExtendedLifetime(widget) { widget.runRowToggleCheck() }
+        guard problems.isEmpty else {
+            FileHandle.standardError.write(Data(("\nrow toggle problems:\n" + problems.joined(separator: "\n") + "\n").utf8))
+            exit(1)
+        }
+        print("\nrow toggle: all transitions ok")
     case "--status":
         print("version: \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
         print("packaged: \(Runtime.isPackaged)")
