@@ -1357,7 +1357,11 @@ private enum Metrics {
     static let colHeaderGap: CGFloat = 5
     static var colHeaderTop: CGFloat { topPadding + titleHeight + colHeaderGap }
     static var codexRowsTop: CGFloat { colHeaderTop + colHeaderHeight + colHeaderGap }
-    static var dividerTop: CGFloat { codexRowsTop + rowPitch + rowHeight + sectionGap }
+    // 2 when the Codex plan has a 5-hour window (or it is still unknown), 1 when the live
+    // data says the plan has none: the 5-hour row is then removed and everything below it,
+    // plus the panel's own height, moves up by one row pitch.
+    static var codexRowCount: Int = 2
+    static var dividerTop: CGFloat { codexRowsTop + rowPitch * CGFloat(codexRowCount - 1) + rowHeight + sectionGap }
     static var claudeTitleTop: CGFloat { dividerTop + 1 + sectionGap }
     static var claudeRowsTop: CGFloat { claudeTitleTop + titleHeight + titleGap }
     static var height: CGFloat { claudeRowsTop + rowPitch * 2 + rowHeight + topPadding }
@@ -1368,9 +1372,11 @@ private enum Metrics {
     static var dividerY: CGFloat { flip(dividerTop, 1) }
     static var claudeTitleY: CGFloat { flip(claudeTitleTop, titleHeight) }
     static var colHeaderY: CGFloat { flip(colHeaderTop, colHeaderHeight) }
+    // Index 0 is the Codex 5-hour row, 1 the Codex weekly row, 2... the Claude rows. With a
+    // single Codex row the weekly row takes the first slot (the hidden 5-hour row shares it).
     static func rowY(_ index: Int) -> CGFloat {
         let top = index < 2
-            ? codexRowsTop + CGFloat(index) * rowPitch
+            ? codexRowsTop + CGFloat(codexRowCount == 2 ? index : 0) * rowPitch
             : claudeRowsTop + CGFloat(index - 2) * rowPitch
         return flip(top, rowHeight)
     }
@@ -1589,6 +1595,8 @@ private enum SkillInstaller {
 
 final class UsageWidget: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
+    private var visual: ClickThroughView!
+    private let divider = NSView()
     private var timer: Timer?
     private var isRefreshing = false
     private var pendingManualRefresh = false
@@ -1658,7 +1666,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         // except the button, keeping the widget out of the way of real windows.
         panel.ignoresMouseEvents = false
 
-        let visual = ClickThroughView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
+        visual = ClickThroughView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
         visual.material = .hudWindow
         visual.blendingMode = .behindWindow
         visual.state = .active
@@ -1694,7 +1702,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
 
         addRow(to: visual, y: Metrics.rowY(0), label: codexFiveLabel, percent: codexFivePercent, reset: codexFiveReset)
         addRow(to: visual, y: Metrics.rowY(1), label: codexWeekLabel, percent: codexWeekPercent, reset: codexWeekReset)
-        let divider = NSView(frame: NSRect(x: Metrics.padding, y: Metrics.dividerY, width: Metrics.width - Metrics.padding * 2, height: 1))
+        divider.frame = NSRect(x: Metrics.padding, y: Metrics.dividerY, width: Metrics.width - Metrics.padding * 2, height: 1)
         divider.wantsLayer = true
         divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.045).cgColor
         visual.addSubview(divider)
@@ -1751,6 +1759,36 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         parent.addSubview(label)
         parent.addSubview(percent)
         parent.addSubview(reset)
+    }
+
+    // Shows or removes the Codex 5-hour row. Every y in the grid is measured from the panel's
+    // bottom edge, so a height change re-places every element; the panel's top edge stays
+    // where it was so the widget shrinks upward-anchored instead of jumping.
+    private func setCodexFiveHourVisible(_ visible: Bool) {
+        let rows = visible ? 2 : 1
+        for field in [codexFiveLabel, codexFivePercent, codexFiveReset] { field.isHidden = !visible }
+        guard rows != Metrics.codexRowCount else { return }
+        Metrics.codexRowCount = rows
+        let top = panel.frame.maxY
+        panel.setFrame(NSRect(x: panel.frame.minX, y: top - Metrics.height, width: Metrics.width, height: Metrics.height), display: false)
+        visual.frame = NSRect(x: 0, y: 0, width: Metrics.width, height: Metrics.height)
+        titleLabel.frame.origin.y = Metrics.codexTitleY
+        percentHeader.frame.origin.y = Metrics.colHeaderY
+        resetHeader.frame.origin.y = Metrics.colHeaderY
+        let rowFields: [[NSTextField]] = [
+            [codexFiveLabel, codexFivePercent, codexFiveReset],
+            [codexWeekLabel, codexWeekPercent, codexWeekReset],
+            [claudeFiveLabel, claudeFivePercent, claudeFiveReset],
+            [claudeWeekLabel, claudeWeekPercent, claudeWeekReset],
+            [claudeScopedLabel, claudeScopedPercent, claudeScopedReset],
+        ]
+        for (index, fields) in rowFields.enumerated() {
+            for field in fields { field.frame.origin.y = Metrics.rowY(index) }
+        }
+        divider.frame.origin.y = Metrics.dividerY
+        claudeTitle.frame.origin.y = Metrics.claudeTitleY
+        layOutStatusRow()
+        visual.needsDisplay = true
     }
 
     private func positionTopLeft() {
@@ -2016,6 +2054,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         let codexNoFiveHour = codexFresh && summary.codex.official?.available == true && summary.codex.official?.fiveHour == nil
         // The plan simply has no such window: leave the percent cell empty and say so in
         // the wider reset cell, instead of a "None / —" pair that reads like a failed read.
+        // Only hide the row on a positive "no such window" answer from fresh live data;
+        // while loading or after a failed read the row stays and shows --%.
+        setCodexFiveHourVisible(!codexNoFiveHour)
         codexFivePercent.stringValue = codexNoFiveHour ? "" : formatPercent(codexFiveRemaining)
         codexWeekPercent.stringValue = formatPercent(codexWeekRemaining)
         codexFiveReset.stringValue = codexNoFiveHour ? strings.noWindowOnPlan : formatReset(codexFresh ? primary?.resets_at : nil, compact: false)
@@ -2173,6 +2214,37 @@ func runHeadless(_ command: String) -> Never {
         // asynchronously, and exit() drops the pending restore while the last measured
         // language had already landed.
         var problems: [String] = []
+        var fiveRowHeight: CGFloat = 0
+        for codexRows in [2, 1] {
+        Metrics.codexRowCount = codexRows
+        let layoutName = codexRows == 2 ? "5-row" : "4-row"
+        print("== layout \(layoutName) (Codex rows: \(codexRows)), panel height \(Int(Metrics.height))pt ==")
+        // Vertical geometry: every visible row inside the panel, in order, without overlap,
+        // and the divider and Claude title between the last Codex row and the first Claude row.
+        let visibleRows = codexRows == 2 ? [0, 1, 2, 3, 4] : [1, 2, 3, 4]
+        var previousBottom = Metrics.colHeaderY  // y of the element above, AppKit coordinates
+        var geometryOK = true
+        for index in visibleRows {
+            let y = Metrics.rowY(index)
+            let top = y + Metrics.rowHeight
+            if y < 0 || top > Metrics.height || top > previousBottom + 0.5 { geometryOK = false
+                problems.append("\(layoutName) row \(index): y=\(y) top=\(top) above-bottom=\(previousBottom) height=\(Metrics.height)") }
+            previousBottom = y
+            if index == 1 {
+                if !(Metrics.dividerY + 1 <= y && Metrics.claudeTitleY + Metrics.titleHeight <= Metrics.dividerY) { geometryOK = false
+                    problems.append("\(layoutName) divider/title out of order") }
+                previousBottom = Metrics.claudeTitleY
+            }
+        }
+        // The 4-row panel must be exactly one row pitch shorter than the 5-row one.
+        if codexRows == 2 { fiveRowHeight = Metrics.height }
+        let expectedHeight: CGFloat = codexRows == 2 ? fiveRowHeight : fiveRowHeight - Metrics.rowPitch
+        if Metrics.height != expectedHeight { geometryOK = false
+            problems.append("\(layoutName) height \(Metrics.height) != \(expectedHeight)") }
+        // The last row must sit exactly one bottom padding above the panel's bottom edge.
+        if Metrics.rowY(4) != Metrics.topPadding { geometryOK = false
+            problems.append("\(layoutName) bottom padding \(Metrics.rowY(4)) != \(Metrics.topPadding)") }
+        print("geometry \(layoutName): \(geometryOK ? "ok" : "PROBLEM")")
         for language in [Language.zhHant, Language.english] {
             let strings = Strings.about(language)
             let title = NSFont.systemFont(ofSize: 12, weight: .semibold)
@@ -2204,15 +2276,17 @@ func runHeadless(_ command: String) -> Never {
                              (language.rawValue as NSString).utf8String!, (name as NSString).utf8String!,
                              width, limit, status))
                 if width > limit {
-                    problems.append("\(language.rawValue) \(name): \(Int(width))pt in a \(Int(limit))pt column")
+                    problems.append("\(layoutName) \(language.rawValue) \(name): \(Int(width))pt in a \(Int(limit))pt column")
                 }
             }
         }
+        }
+        Metrics.codexRowCount = 2
         guard problems.isEmpty else {
             FileHandle.standardError.write(Data(("\n" + problems.joined(separator: "\n") + "\n").utf8))
             exit(1)
         }
-        print("\nno overflow in either language")
+        print("\nno overflow in either language, in both the 5-row and 4-row layouts")
     case "--status":
         print("version: \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
         print("packaged: \(Runtime.isPackaged)")
