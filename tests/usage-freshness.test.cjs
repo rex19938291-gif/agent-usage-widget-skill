@@ -4,8 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 const installer = fs.readFileSync(path.join(__dirname, '../agent-usage-widget-skill/scripts/install-agent-usage-widget.sh'), 'utf8');
-// 機器很忙時可用 USAGE_TEST_TIMEOUT_MS 放寬每次執行的逾時（預設 5 秒）。
-const RUN_TIMEOUT = Number(process.env.USAGE_TEST_TIMEOUT_MS) || 5000;
+// 每次執行的逾時預設 15 秒（機器很忙時 5 秒會誤判），可用 USAGE_TEST_TIMEOUT_MS 覆寫。
+const RUN_TIMEOUT = Number(process.env.USAGE_TEST_TIMEOUT_MS) || 15000;
 const source = installer.split("<<'NODE'\n")[1].split('\nNODE\n')[0];
 function fixture(t, age = 0, expired = false) {
   const tmpRoot = path.join(__dirname, '../.test-tmp');
@@ -1053,8 +1053,12 @@ test('鑰匙圈讀取: security 卡住且忽略終止訊號時，5 秒強制結�
   const fake = path.join(fs.mkdtempSync(path.join(__dirname, '../.test-tmp/sec-')), 'security');
   t.after(() => fs.rmSync(path.dirname(fake), {recursive: true, force: true}));
   fs.writeFileSync(fake, "#!/bin/sh\ntrap '' TERM\nexec /bin/sleep 60\n", {mode: 0o755});
-  const started = Date.now();
-  const r = keychainRun(t, `CLAUDE_SECURITY_BIN = ${JSON.stringify(fake)};`);
-  assert.deepEqual(r, {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false});
-  assert.ok(Date.now() - started < 30000, '必須在 sleep 60 之前結束');
+  // 自訂外層期限 15 秒（不依賴 USAGE_TEST_TIMEOUT_MS），內層在腳本裡量 readClaudeCliLogin 本身的耗時。
+  const f = fixture(t);
+  f.mock(`readClaudeCliLogin = realReadClaudeCliLogin;
+CLAUDE_SECURITY_BIN = ${JSON.stringify(fake)};
+main = async () => { const started = Date.now(); const login = readClaudeCliLogin(); process.stdout.write(JSON.stringify({login, elapsed: Date.now() - started})); };`);
+  const out = JSON.parse(execFileSync(process.execPath, [f.script], {env: {HOME: f.home, PATH: '/usr/bin:/bin'}, encoding: 'utf8', timeout: 15000}));
+  assert.deepEqual(out.login, {accessToken: '', expiresAt: null, hasProfileScope: false, hasRefresh: false});
+  assert.ok(out.elapsed >= 4500 && out.elapsed <= 8000, `內層應約 5 秒結束，實際 ${out.elapsed} 毫秒`);
 });
