@@ -1340,7 +1340,10 @@ struct Strings {
         language.resolved == .english ? .english : .zhHant
     }
 
-    static var current: Strings { about(Language.preference) }
+    // In-memory language override for --check-row-toggle only: it lets the check switch
+    // languages without writing UserDefaults (see the --check-layout note on why that leaks).
+    static var checkOverride: Language?
+    static var current: Strings { about(checkOverride ?? Language.preference) }
 }
 
 // One source of truth for the layout grid: every row is the same height and the same
@@ -1622,6 +1625,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     // Kept so a language change can re-render the numbers already on screen instead of
     // waiting for the next 60-second refresh.
     private var lastSummary: UsageSummary?
+    // Set when the latest read failed and cleared only by the next successful read. While
+    // set, re-rendering (a language switch) must not bring back numbers from lastSummary.
+    private var lastRefreshFailed = false
 
     private let titleLabel = UsageWidget.label(size: 12, weight: .semibold, color: .white.withAlphaComponent(0.70))
     private let updatedLabel = UsageWidget.label(size: 10.5, weight: .regular, color: .white.withAlphaComponent(0.44))
@@ -1759,7 +1765,10 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         // The Codex title carries a data-age suffix and the status line a timestamp, so both
         // are re-rendered from the last summary rather than reset to their initial text —
         // switching language must not look like the numbers went stale.
-        if let lastSummary {
+        if lastRefreshFailed {
+            renderAllUnknown()
+            if isRefreshing { setStatus(strings.updating) }
+        } else if let lastSummary {
             // Re-rendering cached data may keep an already-hidden row hidden, but must never
             // hide a row that loading or a failed read has just brought back.
             updateUI(lastSummary, allowHidingCodexFiveHour: Metrics.codexRowCount == 1)
@@ -1827,9 +1836,26 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         refreshButton.alphaValue = 0.4
     }
 
+    // A failed read means every number on screen is unknown, not "the last good value".
     private func refreshFailedUI() {
+        lastRefreshFailed = true
+        renderAllUnknown()
+    }
+
+    private func renderAllUnknown() {
+        let strings = Strings.current
         showCodexFiveHourUnknown()
-        setStatus(Strings.current.updateFailed)
+        for label in [codexWeekPercent, claudeFivePercent, claudeWeekPercent, claudeScopedPercent] { label.stringValue = "--%" }
+        for label in [codexWeekReset, claudeFiveReset, claudeWeekReset, claudeScopedReset] { label.stringValue = "--" }
+        titleLabel.stringValue = strings.codexTitle + strings.staleData
+        claudeTitle.stringValue = strings.claudeTitle + strings.staleData
+        setStatus(strings.updateFailed)
+    }
+
+    private func refreshSucceeded(_ summary: UsageSummary) {
+        lastRefreshFailed = false
+        lastCompletedAt = Date()
+        updateUI(summary)
     }
 
     // Drives the row through every transition on a never-shown panel and reports any step
@@ -1837,9 +1863,15 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
     func runRowToggleCheck() -> [String] {
         buildPanel(show: false)
         var problems: [String] = []
-        func expect(_ step: String, rows: Int, percent: String? = nil, reset: String? = nil) {
+        func expect(_ step: String, rows: Int, percent: String? = nil, reset: String? = nil,
+                    allUnknown: Bool = false, claudeFive: String? = nil, fiveLabel: String? = nil) {
             let hidden = codexFiveLabel.isHidden
-            let ok = Metrics.codexRowCount == rows && hidden == (rows == 1)
+            let others = [codexWeekPercent, claudeFivePercent, claudeWeekPercent, claudeScopedPercent,
+                          codexWeekReset, claudeFiveReset, claudeWeekReset, claudeScopedReset]
+            let ok = Metrics.codexRowCount == rows
+                && (!allUnknown || others.allSatisfy { $0.stringValue == "--%" || $0.stringValue == "--" })
+                && (claudeFive == nil || claudeFivePercent.stringValue == claudeFive)
+                && (fiveLabel == nil || codexFiveLabel.stringValue == fiveLabel) && hidden == (rows == 1)
                 && codexFivePercent.isHidden == hidden && codexFiveReset.isHidden == hidden
                 && panel.frame.height == Metrics.height
                 && (percent == nil || codexFivePercent.stringValue == percent)
@@ -1851,9 +1883,9 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         }
         let now = ISO8601DateFormatter().string(from: Date())
         let old = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-7200))
-        func summary(_ codexOfficial: String, at: String) -> UsageSummary {
+        func summary(_ codexOfficial: String, at: String, claude: String = "null") -> UsageSummary {
             let json = """
-            {"generatedAt":"\(at)","claude":{"official":null},
+            {"generatedAt":"\(at)","claude":{"official":\(claude)},
              "codex":{"rateLimits":{"primary":{"used_percent":40,"resets_at":2000000000},"secondary":{"used_percent":10,"resets_at":2000000000}},
                       "official":\(codexOfficial)}}
             """
@@ -1861,24 +1893,35 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
         }
         let noWindow = summary(#"{"source":"live","available":true,"fetchedAt":"\#(now)","fiveHour":null,"week":{"usedPercent":10}}"#, at: now)
         let missingKey = summary(#"{"source":"live","available":true,"fetchedAt":"\#(now)","week":{"usedPercent":10}}"#, at: now)
-        let withWindow = summary(#"{"source":"live","available":true,"fetchedAt":"\#(now)","fiveHour":{"usedPercent":40},"week":{"usedPercent":10}}"#, at: now)
+        let claudeFresh = #"{"source":"oauth_usage","available":true,"fetchedAt":"\#(now)","fiveHour":{"usedPercent":30,"resetsAt":2000000000},"weekAll":{"usedPercent":20,"resetsAt":2000000000},"weekScoped":{"usedPercent":10,"resetsAt":2000000000,"label":"Fable"}}"#
+        let withWindow = summary(#"{"source":"live","available":true,"fetchedAt":"\#(now)","fiveHour":{"usedPercent":40},"week":{"usedPercent":10}}"#, at: now, claude: claudeFresh)
         let staleNoWindow = summary(#"{"source":"live","available":true,"fetchedAt":"\#(old)","fiveHour":null,"week":{"usedPercent":10}}"#, at: old)
         let unavailable = summary(#"{"source":"live","available":false,"fetchedAt":"\#(now)","fiveHour":null}"#, at: now)
         let topBefore = panel.frame.maxY
         expect("initial (loading)", rows: 2, percent: "--%", reset: "--")
-        updateUI(noWindow); expect("fresh data, fiveHour explicitly null", rows: 1)
+        refreshSucceeded(noWindow); expect("fresh data, fiveHour explicitly null", rows: 1)
         if panel.frame.maxY != topBefore { problems.append("top edge moved when hiding") }
         beginLoadingUI(); expect("refresh started keeps four rows", rows: 1)
         applyLanguage(); expect("language switch while loading", rows: 1)
-        updateUI(noWindow); expect("fresh no-window again", rows: 1)
+        refreshSucceeded(noWindow); expect("fresh no-window again", rows: 1)
         applyLanguage(); expect("language switch while hidden", rows: 1)
         refreshFailedUI(); expect("child failed / timed out / bad output", rows: 2, percent: "--%", reset: "--")
         applyLanguage(); expect("language switch after failure", rows: 2, percent: "--%", reset: "--")
-        updateUI(missingKey); expect("fiveHour key missing (unknown)", rows: 2, percent: "60%")
-        updateUI(staleNoWindow); expect("stale data with null fiveHour", rows: 2, percent: "--%", reset: "--")
-        updateUI(unavailable); expect("official unavailable", rows: 2, percent: "--%", reset: "--")
-        updateUI(noWindow); expect("fresh no-window before recovery", rows: 1)
-        updateUI(withWindow); expect("plan has 5-hour window again", rows: 2, percent: "60%")
+        refreshSucceeded(missingKey); expect("fiveHour key missing (unknown)", rows: 2, percent: "60%")
+        refreshSucceeded(staleNoWindow); expect("stale data with null fiveHour", rows: 2, percent: "--%", reset: "--")
+        refreshSucceeded(unavailable); expect("official unavailable", rows: 2, percent: "--%", reset: "--")
+        refreshSucceeded(noWindow); expect("fresh no-window before recovery", rows: 1)
+        refreshSucceeded(withWindow); expect("plan has 5-hour window again", rows: 2, percent: "60%")
+        // Numbers on screen -> failed read -> switch through both languages: still unknown.
+        refreshFailedUI(); expect("numbers then failed read", rows: 2, percent: "--%", reset: "--", allUnknown: true)
+        Strings.checkOverride = .zhHant; applyLanguage()
+        expect("failed, switched to zh-Hant", rows: 2, percent: "--%", reset: "--", allUnknown: true, fiveLabel: Strings.about(.zhHant).fiveHour)
+        Strings.checkOverride = .english; applyLanguage()
+        expect("failed, switched to English", rows: 2, percent: "--%", reset: "--", allUnknown: true, fiveLabel: Strings.about(.english).fiveHour)
+        refreshSucceeded(withWindow); expect("next successful read clears failure", rows: 2, percent: "60%", claudeFive: "70%")
+        Strings.checkOverride = .zhHant; applyLanguage()
+        expect("success, switched language keeps numbers", rows: 2, percent: "60%", claudeFive: "70%", fiveLabel: Strings.about(.zhHant).fiveHour)
+        Strings.checkOverride = nil
         if panel.frame.maxY != topBefore { problems.append("top edge moved after restoring") }
         return problems
     }
@@ -2104,8 +2147,7 @@ final class UsageWidget: NSObject, NSApplicationDelegate {
             let succeeded = !timedOut && !process.isRunning && process.terminationStatus == 0
             DispatchQueue.main.async {
                 if succeeded, let summary = try? JSONDecoder().decode(UsageSummary.self, from: data) {
-                    self.lastCompletedAt = Date()
-                    self.updateUI(summary)
+                    self.refreshSucceeded(summary)
                 } else {
                     self.refreshFailedUI()
                 }
