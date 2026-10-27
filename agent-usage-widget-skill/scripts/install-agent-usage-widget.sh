@@ -234,7 +234,11 @@ function claudeCliLoginUsable(login) {
 // lock, and writes it back to the Keychain. The widget only asks it to run once; it
 // never touches the refresh value itself (that would bypass the CLI's lock).
 const CLAUDE_CLI_RENEW_STATE = path.join(CACHE_DIR, "claude-cli-renew.json");
-const CLAUDE_CLI_RENEW_COOLDOWN_MS = 10 * 60 * 1000;
+// Renewal only runs on a manual refresh (the background timer never passes --manual), so
+// a 60-second cooldown matches the manual-refresh throttle and cannot make the timer
+// spawn claude repeatedly. A longer cooldown locked the widget out for 10 minutes after
+// one failed attempt (e.g. pressing refresh right after wake, before the network is up).
+const CLAUDE_CLI_RENEW_COOLDOWN_MS = 60 * 1000;
 let CLAUDE_CLI_RENEW_TIMEOUT_MS = 60 * 1000;
 // No hooks, plugins, MCP servers or project files may run here. --safe-mode (2.1.309
 // --help: hooks, plugins, MCP, CLAUDE.md and more disabled; auth works normally) plus the

@@ -946,7 +946,7 @@ test('CLI 登入: 非手動重新整理即使過期也不叫 CLI', t => {
   assert.equal(data.claude.official.weekScoped.usedPercent, null);
   assert.equal(data.claude.official.fiveHour.usedPercent, 39);
 });
-test('CLI 登入: 10 分鐘冷卻內連按只叫一次 CLI', t => {
+test('CLI 登入: 60 秒冷卻內連按只叫一次 CLI，超過 60 秒才再叫', t => {
   const f = cliFixture(t, {cli: 'hang'});
   f.run('--refresh', '--manual');
   const statePath = path.join(f.install, '.cache/claude-oauth-poll.json');
@@ -955,7 +955,13 @@ test('CLI 登入: 10 分鐘冷卻內連按只叫一次 CLI', t => {
   assert.equal(f.runs(), 1);
   const renew = path.join(f.install, '.cache/claude-cli-renew.json');
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(renew))), ['lastAttemptAt']);
-  fs.writeFileSync(renew, JSON.stringify({lastAttemptAt: Date.now() - 601000}));
+  // 上次續期 30 秒前：仍在 60 秒冷卻內，不再啟動 CLI
+  fs.writeFileSync(renew, JSON.stringify({lastAttemptAt: Date.now() - 30000}));
+  const s1 = JSON.parse(fs.readFileSync(statePath)); s1.startedAt = s1.longLivedStartedAt = Date.now() - 61000; fs.writeFileSync(statePath, JSON.stringify(s1));
+  f.run('--refresh', '--manual');
+  assert.equal(f.runs(), 1);
+  // 上次續期 61 秒前：冷卻已過，再啟動一次
+  fs.writeFileSync(renew, JSON.stringify({lastAttemptAt: Date.now() - 61000}));
   const s2 = JSON.parse(fs.readFileSync(statePath)); s2.startedAt = s2.longLivedStartedAt = Date.now() - 61000; fs.writeFileSync(statePath, JSON.stringify(s2));
   f.run('--refresh', '--manual');
   assert.equal(f.runs(), 2);
